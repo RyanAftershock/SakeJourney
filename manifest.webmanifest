@@ -1,0 +1,14 @@
+{
+  "name": "Sake Journey",
+  "short_name": "Sake Journey",
+  "description": "The companion for Kana - Sake Journey's sake tasting events — remember every pour, every pairing, every night.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#141210",
+  "theme_color": "#141210",
+  "icons": [
+    { "src": "./assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a6bad"/>
+      <stop offset="100%" stop-color="#024e82"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- sake cup (ochoko) -->
+  <path d="M150 214 h212 l-24 96 a86 86 0 0 1 -164 0 z" fill="#f7f3ec"/>
+  <ellipse cx="256" cy="214" rx="106" ry="26" fill="#ffffff"/>
+  <ellipse cx="256" cy="214" rx="72" ry="15" fill="#cfe0ee"/>
+  <!-- rising steam / journey line -->
+  <path d="M214 150 q22 -26 0 -52 q-14 -18 6 -36" fill="none" stroke="#eaf2f9" stroke-width="9" stroke-linecap="round" opacity="0.9"/>
+  <path d="M298 150 q-22 -26 0 -52 q14 -18 -6 -36" fill="none" stroke="#bcd6ea" stroke-width="9" stroke-linecap="round" opacity="0.85"/>
+</svg>

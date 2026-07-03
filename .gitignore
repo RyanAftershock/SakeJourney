@@ -1,0 +1,13 @@
+# dependencies (none today, but keep them out if added)
+node_modules/
+
+# local runtime data (guest ratings, photos) — don't commit
+data/
+
+# secrets
+.env
+.env.local
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

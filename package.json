@@ -1,0 +1,14 @@
+{
+  "name": "sake-journey",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Sake Journey — event-companion PWA + live backend for Kana - Sake Journey's sake tastings",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}
