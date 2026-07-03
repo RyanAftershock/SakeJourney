@@ -67,7 +67,11 @@ async function ratedList(ev, guest) {
 async function returningContext(ev, guest) {
   let name = guest.name || '';
   let ratings = [], eventsById = {}, sakesById = {};
-  const server = Net.guestToken() ? await Net.guestHistory() : null;
+  // Bound the cross-device fetch so a stalled venue connection can't hang the home render (mirrors the
+  // 3s cap in initStore); on timeout we fall back to this device's local ratings.
+  const server = Net.guestToken()
+    ? await Promise.race([Net.guestHistory(), new Promise((r) => setTimeout(() => r(null), 3000))])
+    : null;
   if (server) {                                      // cross-device: everything for this email
     name = (server.guest && server.guest.name) || name;
     ratings = server.ratings || [];
