@@ -15,6 +15,9 @@ import { applyTheme } from '../app.js';
 
 const app = () => document.getElementById('app');
 const go = (h) => { location.hash = h; };
+let _resultsRenderedAt = 0;   // throttles the live results re-render (each one re-fetches photos)
+let _recapSending = false;    // guards against a live re-render re-enabling the send button mid-send
+let _galleryAll = false;      // "show all photos" toggle in the results gallery
 
 const GRADES = ['junmai', 'junmai_ginjo', 'junmai_daiginjo', 'ginjo', 'daiginjo', 'honjozo', 'nigori', 'sparkling', 'koshu'];
 
@@ -80,14 +83,19 @@ export async function home() {
   applyTheme(session.theme || 'default');
   const events = await Events.all();
   const sakes = await Sakes.all();
+  const localGuests = await Guests.all();
 
   const rows = await Promise.all(events.map(async (ev) => {
-    const guests = await Guests.forEvent(ev.id);
+    // Cheap count only — the anonymous aggregate, never the full photo-laden room.
+    const agg = await Net.results(ev.id);
+    const count = (agg && agg.guestCount != null)
+      ? agg.guestCount
+      : localGuests.filter((g) => (g.eventIds || []).includes(ev.id)).length;
     return `
       <div class="list-row" data-ev="${ev.id}">
         <div class="lr-main">
           <div class="t">${esc(ev.title)}</div>
-          <div class="s">${esc(fmtDate(ev.date))} · ${ev.courses.length} pours · ${guests.length} ${guests.length === 1 ? 'guest' : 'guests'}</div>
+          <div class="s">${esc(fmtDate(ev.date))} · ${ev.courses.length} pours · ${count} ${count === 1 ? 'guest' : 'guests'}</div>
         </div>
         <span class="chev">${svg('chev')}</span>
       </div>`;
@@ -264,7 +272,7 @@ export async function eventEditor(id) {
     const btn = $('#fVenueLookup'); btn.disabled = true; btn.textContent = 'Looking up…';
     try {
       const v = await Net.venueLookup(url);
-      if (v.name && !ev.venue) ev.venue = v.name;
+      if (v.name && (!ev.venue || ev.venue === 'Venue TBC')) ev.venue = v.name;
       if (v.image) ev.venueImage = v.image;
       if (v.website) ev.venueUrl = v.website;
       if (v.menuUrl) ev.venueMenuUrl = v.menuUrl;
@@ -423,7 +431,8 @@ export async function results(id) {
     if (r.photoFood) photoItems.push({ ...meta, url: r.photoFood, kind: 'dish' });
     if (r.photo) photoItems.push({ ...meta, url: r.photo, kind: 'photo' });
   }
-  const shownPhotos = photoItems.slice(0, 12);
+  const GALLERY_MIN = 12;
+  const shownPhotos = _galleryAll ? photoItems : photoItems.slice(0, GALLERY_MIN);
 
   const barRows = cards.map(({ s, a }) => {
     const avg = a.n ? a.sum / a.n : 0;
@@ -442,7 +451,7 @@ export async function results(id) {
   const gallery = shownPhotos.map((p, i) => `
     <button class="gallery-tile" data-idx="${i}" title="${p.foodOk ? 'Consented — tap to download' : 'No consent — tap to download (warns first)'}"
       style="position:relative;padding:0;border:none;border-radius:10px;overflow:hidden;cursor:pointer;background:var(--surface-2);aspect-ratio:1">
-      <img src="${p.url}" style="width:100%;height:100%;object-fit:cover;display:block" alt="">
+      <img src="${esc(p.url)}" style="width:100%;height:100%;object-fit:cover;display:block" alt="">
       <span style="position:absolute;top:6px;right:6px;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:800;color:#fff;background:${p.foodOk ? 'var(--good)' : 'var(--danger)'};box-shadow:0 1px 5px rgba(0,0,0,.5)">${p.foodOk ? '✓' : '!'}</span>
     </button>`).join('');
 
@@ -465,7 +474,8 @@ export async function results(id) {
     ${gallery ? `<div class="divider"><span class="k">写</span></div>
       <div class="eyebrow" style="color:var(--ink-3);margin-bottom:6px">Guest gallery</div>
       <p class="faint" style="font-size:.76rem;margin:0 0 10px">Tap a photo to download. <b style="color:var(--good)">✓</b> guest consented · <b style="color:var(--danger)">!</b> no consent (warns first). ${faceConsent} of ${identified.length} also OK’d their face.</p>
-      <div class="grid-2" style="grid-template-columns:1fr 1fr 1fr">${gallery}</div>` : ''}
+      <div class="grid-2" style="grid-template-columns:1fr 1fr 1fr">${gallery}</div>
+      ${photoItems.length > GALLERY_MIN ? `<button class="linkbtn" id="galleryToggle" style="display:block;margin:12px auto 0">${_galleryAll ? 'Show fewer' : `Show all ${photoItems.length} photos`}</button>` : ''}` : ''}
 
     <button class="btn primary block mt-24" id="sendRecaps">${svg('sparkle')} Send recap emails</button>
     <button class="btn subtle block mt-8" id="csv">${svg('share')} Export guests (CSV)</button>
@@ -475,23 +485,36 @@ export async function results(id) {
 
   $('#csv').onclick = () => exportCSV(ev, identified);
   $$('.gallery-tile').forEach((el) => (el.onclick = () => downloadPhoto(shownPhotos[+el.dataset.idx])));
+  if ($('#galleryToggle')) $('#galleryToggle').onclick = () => { _galleryAll = !_galleryAll; results(id); };
   $('#sendRecaps').onclick = async () => {
-    const opted = identified.filter((g) => g.consentMarketing && g.email && ratedGuestIds.has(g.id)).length;
-    if (!opted) { toast('No opted-in guests with ratings to recap yet'); return; }
-    if (!confirm(`Email a personal recap to the ${opted} opted-in guest${opted === 1 ? '' : 's'}?`)) return;
+    // Recap is transactional — everyone who chose to save/email their night and actually rated something.
+    const recipients = identified.filter((g) => g.email && !g.unsubscribed && ratedGuestIds.has(g.id)).length;
+    if (!recipients) { toast('No guests with a saved email and ratings to recap yet'); return; }
+    if (_recapSending) return;
+    if (!confirm(`Email a personal recap to the ${recipients} guest${recipients === 1 ? '' : 's'} who saved their night?`)) return;
+    _recapSending = true;
     const btn = $('#sendRecaps'); btn.disabled = true; btn.textContent = 'Sending…';
     try {
       const r = await Net.sendRecaps(id);
       if (r.error === 'email_not_configured') { toast(`Email isn’t set up on the server (set RESEND_API_KEY). ${r.wouldSend} recap${r.wouldSend === 1 ? '' : 's'} ready to send.`, 3800); btn.disabled = false; btn.textContent = 'Send recap emails'; }
+      else if (r.skipped) { toast('Recaps were just sent for this event — hold on a minute before resending.', 3600); btn.textContent = 'Sent ✓'; }
       else { toast(`Sent ${r.sent} recap${r.sent === 1 ? '' : 's'}${r.failed ? ` · ${r.failed} failed` : ''} ✨`, 3200); btn.textContent = `Sent ${r.sent} ✓`; }
     } catch (e) { btn.disabled = false; btn.textContent = 'Send recap emails'; toast('Send failed: ' + e.message, 3400); }
+    finally { _recapSending = false; }
   };
 
   // Live: the room's ratings, favourites and gallery update as guests tap.
+  // Throttled — each re-render re-fetches the room, so cap it at ~once per 4s.
+  _resultsRenderedAt = Date.now();
   let t;
-  Net.subscribe(id, () => { clearTimeout(t); t = setTimeout(() => {
-    if ((location.hash || '').startsWith('#/host/results/')) results(id);
-  }, 500); });
+  Net.subscribe(id, () => {
+    if (_recapSending) return;            // don't re-render (and re-enable the send button) mid-send
+    clearTimeout(t);
+    const wait = Math.max(600, 4000 - (Date.now() - _resultsRenderedAt));
+    t = setTimeout(() => {
+      if ((location.hash || '').startsWith('#/host/results/') && !_recapSending) results(id);
+    }, wait);
+  });
 }
 
 /** Download a gallery photo, warning first if the guest didn't consent to photo use. */
@@ -517,9 +540,16 @@ function downloadPhoto(p) {
 
 function exportCSV(ev, guests) {
   const head = 'name,email,marketing_consent,photo_food_consent,photo_me_consent,consent_at\n';
+  // Neutralise spreadsheet formula injection: a value like =HYPERLINK(...) or +cmd is prefixed with '
+  // so Excel/Sheets treat it as text, not a live formula.
+  const csvCell = (v) => {
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return `"${s.replace(/"/g, '""')}"`;
+  };
   const rows = guests.map((g) =>
     [g.name, g.email, g.consentMarketing, g.consentPhotoFood, g.consentPhotoMe, g.consentAt ? new Date(g.consentAt).toISOString() : '']
-      .map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+      .map(csvCell).join(',')).join('\n');
   const blob = new Blob([head + rows], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -625,7 +655,7 @@ export async function share(id) {
       <h1 class="serif" style="font-size:1.9rem">${esc(ev.title)}</h1>
       <p class="muted" style="font-size:.92rem">Print this on the table. Guests scan with their phone camera — no app to install.</p>
       <div class="qr-wrap mt-16">
-        <img id="qr" src="${qrSrc}" alt="QR code" onerror="this.style.display='none';document.getElementById('qrfallback').style.display='block'">
+        <img id="qr" src="${esc(qrSrc)}" alt="QR code">
         <div id="qrfallback" style="display:none;color:#141210">${svg('qr')}<br>QR needs a connection to render.</div>
         <div style="color:#141210;font-weight:700;font-family:var(--font-display);font-size:1.1rem">${esc(ev.title)}</div>
       </div>
@@ -638,6 +668,8 @@ export async function share(id) {
     </div>
   `);
   wireShell('#/host');
+  const qrImg = $('#qr');
+  if (qrImg) qrImg.onerror = () => { qrImg.style.display = 'none'; const f = $('#qrfallback'); if (f) f.style.display = 'block'; };
   $('#copy').onclick = async () => { try { await navigator.clipboard.writeText(link); toast('Link copied'); } catch { toast('Copy failed — long-press the link'); } };
   $('#open').onclick = () => { session.activeEventId = id; go('#/'); };
 }

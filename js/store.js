@@ -9,7 +9,7 @@ import { SEED_EVENT, SEED_SAKES } from './seed.js';
 import * as Net from './net.js';
 
 const DB_NAME = 'sake-journey';
-const DB_VERSION = 1;
+const DB_VERSION = 2;   // v2 adds the durable 'outbox' store (was localStorage — quota-bound)
 
 /** Generate a short unique id (crypto when available, else fallback). */
 export function uid(prefix = 'id') {
@@ -36,6 +36,7 @@ function openDB() {
         r.createIndex('guestEvent', 'guestEvent', { unique: false });
       }
       if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'k' });
+      if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox', { keyPath: 'k' });
     };
     req.onsuccess = () => { _db = req.result; resolve(_db); };
     req.onerror = () => reject(req.error);
@@ -60,6 +61,16 @@ async function allByIndex(store, index, key) {
   const os = await tx(store, 'readonly');
   return reqP(os.index(index).getAll(key));
 }
+
+/* ---------- Outbox (durable offline write queue, in IndexedDB) ----------
+   Full request bodies (incl. photo patches) live here instead of localStorage, so a photo-heavy
+   offline dinner can never blow the ~5MB localStorage quota and silently drop a guest's ratings. */
+export const Outbox = {
+  get: (k) => get('outbox', k),
+  all: () => all('outbox'),
+  put: (k, v) => put('outbox', { k, ...v }),
+  del: (k) => del('outbox', k),
+};
 
 /* ---------- Session (light, in localStorage) ---------- */
 const LS = {
@@ -87,20 +98,23 @@ export async function initStore() {
   }
   // Sync with the backend when reachable: pull the shared events + sake library
   // (so every device sees the same menu Kana - Sake Journey authored) and flush offline writes.
+  // Bounded by a 3s cap so a stalled (not failed) connection can't hang the first render.
   try {
-    const boot = await Net.bootstrap();
+    const boot = await Promise.race([Net.bootstrap(), new Promise((r) => setTimeout(() => r(null), 3000))]);
     if (boot) {
       for (const e of boot.events || []) await put('events', e);
       for (const s of boot.sakes || []) await put('sakes', s);
     }
-    await Net.flushOutbox();
+    Net.flushOutbox();   // fire-and-forget; never blocks boot
   } catch { /* offline — the local seed stands in */ }
 }
 
 /** Wipe everything and re-seed — handy for demos. */
 export async function resetAll() {
   const db = await openDB();
-  await Promise.all(['events', 'sakes', 'guests', 'ratings', 'meta'].map(
+  // Include 'outbox' — otherwise a queued offline write survives the reset and re-pushes the exact
+  // ratings/guests the reset was meant to wipe on the next flush.
+  await Promise.all(['events', 'sakes', 'guests', 'ratings', 'meta', 'outbox'].map(
     (s) => reqP(db.transaction(s, 'readwrite').objectStore(s).clear())
   ));
   session.guestId = null;
@@ -112,6 +126,16 @@ export const Events = {
   get: (id) => get('events', id),
   all: () => all('events'),
   async save(ev) { await put('events', ev); Net.pushEvent(ev); return ev; },
+  /** Pull the shared events + library from the server into local cache — WITHOUT pushing back
+      (used when a scanned QR references an event this device hasn't synced yet). */
+  async syncFromServer() {
+    const boot = await Net.bootstrap();
+    if (boot) {
+      for (const e of (boot.events || [])) await put('events', e);
+      for (const s of (boot.sakes || [])) await put('sakes', s);
+    }
+    return boot;
+  },
 };
 
 /* ---------- Sakes (the reusable library / moat) ---------- */
@@ -149,9 +173,9 @@ export const Guests = {
   get: (id) => get('guests', id),
   all: () => all('guests'),
   async save(g) { await put('guests', g); Net.pushGuest(g); return g; },
-  /** All guests at an event — from the server (every device) when online, else local. */
+  /** All guests at an event — the host's full room view (needs host auth), else local. */
   async forEvent(eventId) {
-    const srv = await Net.results(eventId);
+    const srv = await Net.results(eventId, { full: true });
     if (srv && srv.guests) return srv.guests;
     const gs = await all('guests');
     return gs.filter((g) => (g.eventIds || []).includes(eventId));
@@ -180,16 +204,18 @@ export const Ratings = {
     };
     Object.assign(existing, patch, { updatedAt: Date.now() });
     await put('ratings', existing);
-    Net.pushRating(existing);            // sync to the shared event (offline-queued if needed)
+    // Send ONLY the changed fields (+ identity keys), not the whole photo-laden record — the server
+    // merges. A heart tap sends {s1}, not two photos. The outbox merges patches for the same rating.
+    Net.pushRating({ id: key, guestId, eventId, sakeId, guestEvent: `${guestId}__${eventId}`, ...patch, updatedAt: existing.updatedAt });
     return existing;
   },
 
   // This guest's own ratings — always local (works offline; it's their device's data).
   forGuestEvent: (guestId, eventId) => allByIndex('ratings', 'guestEvent', `${guestId}__${eventId}`),
 
-  // Every guest's ratings for an event — from the server (the whole room) when online.
+  // Every guest's ratings for an event — the host's full room view (needs host auth), else local.
   async forEvent(eventId) {
-    const srv = await Net.results(eventId);
+    const srv = await Net.results(eventId, { full: true });
     if (srv && srv.ratings) return srv.ratings;
     return allByIndex('ratings', 'eventId', eventId);
   },

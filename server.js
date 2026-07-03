@@ -7,11 +7,13 @@
    ============================================================ */
 
 import { createServer } from 'node:http';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { lookup as dnsLookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname, resolve } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { SEED_EVENT, SEED_SAKES } from './js/seed.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -65,26 +67,49 @@ let db = { events: {}, sakes: {}, guests: {}, ratings: {}, magicTokens: {}, gues
 async function loadDB() {
   if (existsSync(DB_FILE)) {
     try { db = JSON.parse(await readFile(DB_FILE, 'utf8')); }
-    catch { console.warn('db.json unreadable — reseeding'); seed(); }
+    catch {
+      // NEVER reseed over an existing-but-unreadable file (a truncated write, etc.) — that would
+      // destroy recoverable data. Preserve it untouched, then start fresh so the server still boots.
+      const aside = `${DB_FILE}.corrupt-${Date.now()}`;
+      try { await rename(DB_FILE, aside); console.error(`db.json unreadable — preserved at ${aside}, starting fresh`); }
+      catch (e) { console.error('db.json unreadable and could not be preserved:', e); }
+      seed();
+    }
   } else {
     seed();
   }
   // Ensure required collections exist even in an older db.
   for (const k of ['events', 'sakes', 'guests', 'ratings', 'magicTokens', 'guestTokens']) db[k] = db[k] || {};
-  if (!db.events[SEED_EVENT.id]) { db.events[SEED_EVENT.id] = SEED_EVENT; save(); }
+  let dirty = false;
+  // One-time migration: the OLD email-based unsubscribe only set consentMarketing=false (no `unsubscribed`
+  // flag existed). Mark those legacy opt-outs unsubscribed=true so the new transactional recap excludes them.
+  if (!db._migratedUnsub) {
+    for (const g of Object.values(db.guests)) if (g.unsubscribed === undefined && g.consentMarketing === false) g.unsubscribed = true;
+    db._migratedUnsub = true; dirty = true;
+  }
+  if (!db.events[SEED_EVENT.id]) { db.events[SEED_EVENT.id] = SEED_EVENT; dirty = true; }
+  if (dirty) save();
 }
 function seed() {
   db = { events: {}, sakes: {}, guests: {}, ratings: {}, magicTokens: {}, guestTokens: {} };
   for (const s of SEED_SAKES) db.sakes[s.id] = s;
   db.events[SEED_EVENT.id] = SEED_EVENT;
 }
-let saveTimer = null;
+// Debounced, serialised, ATOMIC persistence: write a temp file then rename over db.json
+// (rename is atomic on the same volume), so a crash mid-write can never truncate the live file.
+// Writes are chained so two flushes never interleave. Compact JSON (no pretty-print) to cut work.
+let saveTimer = null, saveChain = Promise.resolve(), dbDirReady = false;
+async function persist() {
+  if (!dbDirReady) { await mkdir(DB_DIR, { recursive: true }); dbDirReady = true; }
+  const tmp = `${DB_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(db));
+  await rename(tmp, DB_FILE);
+}
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    try { await mkdir(DB_DIR, { recursive: true }); await writeFile(DB_FILE, JSON.stringify(db, null, 2)); }
-    catch (e) { console.error('save failed', e); }
-  }, 120);
+  saveTimer = setTimeout(() => {
+    saveChain = saveChain.then(persist).catch((e) => console.error('save failed', e));
+  }, 300);
 }
 
 /* ---------- Live updates (SSE) ---------- */
@@ -100,6 +125,16 @@ function broadcast(eventId, type = 'update') {
   const payload = `event: ${type}\ndata: ${JSON.stringify({ t: Date.now() })}\n\n`;
   for (const res of s) { try { res.write(payload); } catch { /* client gone */ } }
 }
+// Heartbeat: keep SSE connections alive through proxies, and bound in-memory state by sweeping
+// expired magic/session tokens and stale rate-limit buckets.
+const _housekeep = setInterval(() => {
+  for (const set of streams.values()) for (const res of set) { try { res.write(': ping\n\n'); } catch { /* gone */ } }
+  const now = Date.now();
+  for (const k of Object.keys(db.magicTokens)) if (db.magicTokens[k].exp < now) delete db.magicTokens[k];
+  for (const k of Object.keys(db.guestTokens)) { const s = db.guestTokens[k]; if (s.exp && s.exp < now) delete db.guestTokens[k]; }
+  for (const [k, e] of _rl) if (e.resetAt < now) _rl.delete(k);
+}, 25_000);
+_housekeep.unref?.();
 
 /* ---------- Helpers ---------- */
 const MIME = {
@@ -111,7 +146,7 @@ const MIME = {
 };
 function sendJSON(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), ...SEC_HEADERS });
   res.end(body);
 }
 function readBody(req) {
@@ -125,8 +160,64 @@ function readBody(req) {
 function isHost(req) {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  return !!token && token === HOST_PASSCODE;
+  return !!token && timingSafeEqualStr(token, HOST_PASSCODE);
 }
+// Constant-time string compare so the passcode can't be probed via response timing.
+function timingSafeEqualStr(a, b) {
+  const ab = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) { try { timingSafeEqual(ab, ab); } catch {} return false; }
+  return timingSafeEqual(ab, bb);
+}
+
+// Only ever store photos that are genuine image data URLs — a rating field carrying
+// anything else (e.g. a string crafted to break out of an <img src>) is dropped, not saved.
+const DATA_IMG_RE = /^data:image\/(?:jpe?g|png|webp|gif);base64,[A-Za-z0-9+/=\s]+$/;
+function sanitizePhotos(r) {
+  for (const k of ['photoBottle', 'photoFood', 'photo']) {
+    if (!(k in r)) continue;
+    const v = r[k];
+    if (v === null || v === '') continue;                 // allow explicit clear
+    if (typeof v !== 'string' || v.length > 9_000_000 || !DATA_IMG_RE.test(v)) delete r[k];
+  }
+}
+
+// Only known fields are ever written — an attacker can't smuggle arbitrary properties into a record.
+const pick = (obj, keys) => { const o = {}; for (const k of keys) if (k in obj) o[k] = obj[k]; return o; };
+const RATING_FIELDS = ['id', 'guestId', 'eventId', 'sakeId', 'guestEvent', 's1', 's2', 'wouldBuy', 'photoBottle', 'photoFood', 'photo', 'note', 'createdAt', 'updatedAt'];
+const GUEST_FIELDS = ['id', 'name', 'email', 'consentMarketing', 'consentPhotoFood', 'consentPhotoMe', 'consentAt', 'eventIds', 'createdAt', 'identified'];
+const SAKE_FIELDS = ['id', 'name', 'romaji', 'brewery', 'region', 'grade', 'type4', 'temp', 'smv', 'acidity', 'amino', 'abv', 'seimai', 'profile', 'tags', 'adhoc', 'eventId', 'addedBy', '_deleted'];
+// Generous ceilings that never bite a real event but cap runaway abuse of the open write endpoints.
+const MAX_RATINGS_PER_EVENT = 6000, MAX_GUESTS_PER_EVENT = 1500, MAX_SAKES = 6000;
+const countBy = (coll, pred) => Object.values(coll).reduce((n, x) => n + (pred(x) ? 1 : 0), 0);
+
+/* ---------- rate limiting (in-memory) ---------- */
+const _rl = new Map();   // key -> { count, resetAt }
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const e = _rl.get(key);
+  if (!e || e.resetAt < now) { _rl.set(key, { count: 1, resetAt: now + windowMs }); return true; }
+  if (e.count >= max) return false;
+  e.count++; return true;
+}
+function clientIp(req) {
+  return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+}
+
+/* ---------- security headers ---------- */
+const SEC_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+};
+const CSP = [
+  "default-src 'self'",
+  "img-src 'self' data: https:",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "script-src 'self'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'", "base-uri 'self'", "form-action 'self'",
+].join('; ');
 
 /* ---------- Menu scanning via the Claude API (optional) ---------- */
 async function parseMenuImage(mediaType, b64) {
@@ -165,23 +256,47 @@ const decodeEntities = (s = '') => s
   .replace(/&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
   .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
 function resolveUrl(base, href) { try { return new URL(href, base).toString(); } catch { return null; } }
-function isSafeUrl(u) {
+function isPrivateIp(ip) {
+  const v = isIP(ip);
+  if (v === 4) {
+    const o = ip.split('.').map(Number);
+    if (o[0] === 127 || o[0] === 10 || o[0] === 0) return true;
+    if (o[0] === 192 && o[1] === 168) return true;
+    if (o[0] === 169 && o[1] === 254) return true;                 // link-local + cloud metadata (169.254.169.254)
+    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;
+    if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true;    // CGNAT
+    return false;
+  }
+  if (v === 6) {
+    const l = ip.toLowerCase();
+    if (l === '::1' || l === '::') return true;
+    if (l.startsWith('fe80') || l.startsWith('fc') || l.startsWith('fd')) return true;  // link-local + ULA
+    if (l.startsWith('::ffff:')) return isPrivateIp(l.slice(7));                          // v4-mapped
+    return false;
+  }
+  return false;
+}
+// Resolve the host and require EVERY address to be public — defeats numeric-IP encodings
+// (http://2130706433/) and names that resolve to internal/metadata addresses. (Host-only endpoint;
+// full DNS-rebind protection would additionally pin the socket to the validated IP.)
+async function isSafeUrl(u) {
+  let url;
+  try { url = new URL(u); } catch { return false; }
+  if (!/^https?:$/.test(url.protocol)) return false;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) return false;
+  if (isIP(host)) return !isPrivateIp(host);
+  if (/^(0x[0-9a-f]+|\d+|0[0-7]+)$/i.test(host)) return false;     // decimal/hex/octal integer "IP"
   try {
-    const url = new URL(u);
-    if (!/^https?:$/.test(url.protocol)) return false;
-    const h = url.hostname.toLowerCase();
-    if (h === 'localhost' || h.endsWith('.local') || h.endsWith('.internal')) return false;
-    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return false;
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
-    if (h === '::1' || h === '[::1]') return false;
-    return true;
+    const addrs = await dnsLookup(host, { all: true });
+    return addrs.length > 0 && addrs.every((a) => !isPrivateIp(a.address));
   } catch { return false; }
 }
 async function lookupVenue(input) {
   let url = (input || '').trim();
   if (!url) throw new Error('no url');
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-  if (!isSafeUrl(url)) throw new Error('unsupported url');
+  if (!(await isSafeUrl(url))) throw new Error('unsupported url');
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
   let finalUrl = url, html = '';
@@ -191,7 +306,7 @@ async function lookupVenue(input) {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SakeJourney/1.0; +https://sake-journey.com)', Accept: 'text/html,*/*' },
     });
     finalUrl = r.url || url;
-    if (!isSafeUrl(finalUrl)) throw new Error('redirected to unsupported url');
+    if (!(await isSafeUrl(finalUrl))) throw new Error('redirected to unsupported url');
     html = (await r.text()).slice(0, 1_500_000);
   } finally { clearTimeout(timer); }
 
@@ -222,10 +337,10 @@ const normEmail = (e) => String(e || '').trim().toLowerCase();
 const escHtml = (s = '') => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const heartStr = (n) => '★'.repeat(Math.max(0, Math.min(5, n))) + '☆'.repeat(5 - Math.max(0, Math.min(5, n)));
 
-function baseUrl(req) {
-  if (PUBLIC_URL) return PUBLIC_URL.replace(/\/+$/, '');
-  const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
-  return `${proto}://${req.headers.host}`;
+// Links inside emails must NEVER be derived from the client Host header (host-header injection →
+// poisoned magic links → account takeover). Always use the configured PUBLIC_URL; localhost only for dev.
+function baseUrl() {
+  return (PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 }
 const guestsByEmail = (email) => {
   const e = normEmail(email);
@@ -242,7 +357,9 @@ function guestEmailFromReq(req) {
   const auth = req.headers['authorization'] || '';
   const tok = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const s = tok && db.guestTokens[tok];
-  return s ? s.email : null;
+  if (!s) return null;
+  if (s.exp && s.exp < Date.now()) { delete db.guestTokens[tok]; save(); return null; }
+  return s.email;
 }
 function guestEventItems(guestId, event) {
   const eng = (r) => r && (r.s1 || r.s2 || r.wouldBuy || r.photoBottle || r.photoFood || r.photo);
@@ -319,7 +436,7 @@ function recapEmail(guest, event, items, journeyLink, unsubLink) {
     ${venueLinksHtml(event)}
     <p style="margin:20px 0 6px">${emailBtn(journeyLink, 'Open your full sake journey')}</p>
     <p style="color:#8a96a0;font-size:12px">See your photos and every pour you've tasted with ${escHtml(event.host)}.</p>`;
-  return emailShell(inner, `You're receiving this because you opted in at ${escHtml(event.title)}. <a href="${escHtml(unsubLink)}" style="color:#8a96a0">Unsubscribe</a>.`);
+  return emailShell(inner, `You're receiving this because you asked us to email your recap of ${escHtml(event.title)}. <a href="${escHtml(unsubLink)}" style="color:#8a96a0">Unsubscribe</a>.`);
 }
 
 /* ---------- API ---------- */
@@ -331,8 +448,9 @@ async function handleAPI(req, res, url) {
 
   // Host login — validates the shared passcode (which then rides as a Bearer token).
   if (req.method === 'POST' && p === '/api/host/login') {
+    if (!rateLimit('hl:' + clientIp(req), 12, 5 * 60 * 1000)) return sendJSON(res, 429, { ok: false, error: 'too_many_attempts' });
     const b = await readBody(req);
-    if (b.passcode && b.passcode === HOST_PASSCODE) return sendJSON(res, 200, { ok: true });
+    if (b.passcode && timingSafeEqualStr(b.passcode, HOST_PASSCODE)) return sendJSON(res, 200, { ok: true });
     return sendJSON(res, 401, { ok: false });
   }
 
@@ -360,14 +478,20 @@ async function handleAPI(req, res, url) {
     const b = await readBody(req);
     const email = normEmail(b.email);
     if (!email.includes('@')) return sendJSON(res, 400, { error: 'bad_email' });
+    // Throttle by IP and by target email so this can't be used to bomb a victim's inbox.
+    if (!rateLimit('gli:' + clientIp(req), 20, 10 * 60 * 1000) || !rateLimit('gle:' + email, 5, 15 * 60 * 1000))
+      return sendJSON(res, 429, { error: 'too_many_requests' });
     const hasAccount = guestsByEmail(email).length > 0;
-    const link = `${baseUrl(req)}/#/claim/${makeMagicToken(email, 15 * 60 * 1000)}`;
+    const link = `${baseUrl()}/#/claim/${makeMagicToken(email, 15 * 60 * 1000)}`;
     if (RESEND_API_KEY) {
       try { await sendEmail({ to: email, subject: 'Your Sake Journey sign-in link', html: magicLinkEmail(link), text: `Open your sake journey: ${link}` }); }
       catch (e) { console.error('login email failed:', e.message); return sendJSON(res, 502, { error: 'email_failed', message: e.message }); }
       return sendJSON(res, 200, { ok: true, sent: true, hasAccount });
     }
-    return sendJSON(res, 200, { ok: true, sent: false, hasAccount, devLink: link });  // dev: no provider set
+    // Return the link only in dev (no PUBLIC_URL configured). A configured deployment NEVER hands a
+    // valid token back over the API — otherwise anyone could claim any email.
+    if (!PUBLIC_URL) return sendJSON(res, 200, { ok: true, sent: false, hasAccount, devLink: link });
+    return sendJSON(res, 200, { ok: true, sent: false, hasAccount, error: 'email_not_configured' });
   }
 
   // Claim a magic-link token → returns a session token + the guest for that email.
@@ -384,7 +508,7 @@ async function handleAPI(req, res, url) {
       db.guests[guest.id] = guest;
     }
     const sessionToken = rid(24);
-    db.guestTokens[sessionToken] = { email: t.email, createdAt: Date.now() };
+    db.guestTokens[sessionToken] = { email: t.email, createdAt: Date.now(), exp: Date.now() + 90 * 24 * 60 * 60 * 1000 };
     save();
     return sendJSON(res, 200, { sessionToken, email: t.email, guest });
   }
@@ -406,37 +530,66 @@ async function handleAPI(req, res, url) {
     const b = await readBody(req);
     const event = db.events[b.eventId];
     if (!event) return sendJSON(res, 404, { error: 'no_event' });
-    const base = baseUrl(req);
+    const base = baseUrl();
+    // A recap is a transactional email the guest ASKED for (they chose to save/email their night).
+    // It is NOT gated by marketing consent — only an explicit unsubscribe removes them.
     const recipients = Object.values(db.guests)
-      .filter((g) => g.identified && g.email && g.consentMarketing && (g.eventIds || []).includes(event.id))
+      .filter((g) => g.identified && g.email && !g.unsubscribed && (g.eventIds || []).includes(event.id))
       .filter((g) => guestEventItems(g.id, event).length > 0);
     const build = (g) => {
+      if (!g.unsubToken) g.unsubToken = rid(12);   // stable opaque per-guest unsubscribe token
       const items = guestEventItems(g.id, event);
       const journeyLink = `${base}/#/claim/${makeMagicToken(g.email, 30 * 24 * 60 * 60 * 1000)}`;
-      const unsubLink = `${base}/unsubscribe?e=${encodeURIComponent(g.email)}`;
+      const unsubLink = `${base}/unsubscribe?u=${encodeURIComponent(g.unsubToken)}`;
       return recapEmail(g, event, items, journeyLink, unsubLink);
     };
     if (!RESEND_API_KEY) {
       return sendJSON(res, 200, { error: 'email_not_configured', wouldSend: recipients.length, preview: recipients[0] ? build(recipients[0]) : null });
     }
+    // Idempotency: a double-click or a live re-render firing a second send within a minute is a no-op.
+    const now = Date.now();
+    if (event._lastRecapAt && now - event._lastRecapAt < 60_000)
+      return sendJSON(res, 200, { sent: 0, skipped: true, reason: 'just_sent', recipients: recipients.length });
+    event._lastRecapAt = now; save();
     let sent = 0, failed = 0;
     for (const g of recipients) {
       try { await sendEmail({ to: g.email, subject: `Your night at ${event.title}`, html: build(g) }); sent++; }
       catch (e) { failed++; console.error('recap email failed:', g.email, e.message); }
     }
+    save();
     return sendJSON(res, 200, { sent, failed, recipients: recipients.length });
   }
 
-  // Everything a device needs to render events: the events + the full sake library.
+  // Everything a device needs to render events: the events + the curated sake library.
+  // Ad-hoc surprise pours stay on the device that created them (and in that guest's history) —
+  // they're never shipped to every device, so bootstrap can't grow without bound.
   if (req.method === 'GET' && p === '/api/bootstrap') {
-    return sendJSON(res, 200, { events: Object.values(db.events), sakes: Object.values(db.sakes) });
+    const sakes = Object.values(db.sakes).filter((s) => !s.adhoc && !s._deleted);
+    return sendJSON(res, 200, { events: Object.values(db.events), sakes });
   }
 
-  // Aggregate feed for the host results + guest "room favourite" (ALL guests).
+  // Results feed. Two shapes:
+  //  • public (default): an ANONYMOUS aggregate only — per-sake score sums + counts, and a
+  //    head count. No emails, no names, no consent, no photos, no notes. Safe for guest devices
+  //    (powers the "room's favourite" moment) and event ids are not secret.
+  //  • full=1 (host-only): the whole room — guest records + ratings incl. photos — for the studio.
   if (req.method === 'GET' && p === '/api/results') {
-    const guests = Object.values(db.guests).filter((g) => (g.eventIds || []).includes(eventId));
-    const ratings = Object.values(db.ratings).filter((r) => r.eventId === eventId);
-    return sendJSON(res, 200, { guests, ratings });
+    const evRatings = Object.values(db.ratings).filter((r) => r.eventId === eventId);
+    if (url.searchParams.get('full')) {
+      if (!isHost(req)) return sendJSON(res, 401, { error: 'unauthorized' });
+      const guests = Object.values(db.guests).filter((g) => (g.eventIds || []).includes(eventId));
+      return sendJSON(res, 200, { guests, ratings: evRatings });
+    }
+    const agg = {};
+    for (const r of evRatings) {
+      const f = r.s2 || r.s1;
+      const a = agg[r.sakeId] || (agg[r.sakeId] = { sum: 0, n: 0, buys: 0, photos: 0 });
+      if (f) { a.sum += f; a.n += 1; }
+      if (r.wouldBuy) a.buys += 1;
+      if (r.photoBottle || r.photoFood || r.photo) a.photos += 1;
+    }
+    const guestCount = Object.values(db.guests).filter((g) => (g.eventIds || []).includes(eventId)).length;
+    return sendJSON(res, 200, { agg, guestCount });
   }
 
   // Live stream
@@ -450,26 +603,45 @@ async function handleAPI(req, res, url) {
     return;
   }
 
-  // Upserts
+  // Upserts. Guest-facing writes are open (device-local identity) but hardened: only known fields
+  // are accepted, growth is capped, and existing identified/library records can't be clobbered.
   if (req.method === 'PUT' && p === '/api/ratings') {
-    const r = await readBody(req);
+    const r = pick(await readBody(req), RATING_FIELDS);
     if (!r.id) return sendJSON(res, 400, { error: 'missing id' });
+    sanitizePhotos(r);
+    if (!db.ratings[r.id] && countBy(db.ratings, (x) => x.eventId === r.eventId) >= MAX_RATINGS_PER_EVENT)
+      return sendJSON(res, 429, { error: 'event_full' });
     db.ratings[r.id] = { ...db.ratings[r.id], ...r }; save();
     broadcast(r.eventId);
     return sendJSON(res, 200, db.ratings[r.id]);
   }
   if (req.method === 'POST' && p === '/api/guests') {
-    const g = await readBody(req);
+    const g = pick(await readBody(req), GUEST_FIELDS);
     if (!g.id) return sendJSON(res, 400, { error: 'missing id' });
-    db.guests[g.id] = { ...db.guests[g.id], ...g }; save();
+    const existing = db.guests[g.id];
+    if (!existing && countBy(db.guests, () => true) >= MAX_GUESTS_PER_EVENT * 50)
+      return sendJSON(res, 429, { error: 'too_many_guests' });
+    if (existing && existing.identified && !g.identified) {
+      // Never let a fresh, blank device record overwrite an identified guest's name/email/consent —
+      // only merge additive event membership.
+      const eventIds = [...new Set([...(existing.eventIds || []), ...(g.eventIds || [])])];
+      db.guests[g.id] = { ...existing, eventIds };
+    } else {
+      db.guests[g.id] = { ...existing, ...g };
+    }
+    // Re-opting into marketing clears any prior unsubscribe (a migrated legacy opt-out can opt back in).
+    if (g.consentMarketing === true && db.guests[g.id].unsubscribed) db.guests[g.id].unsubscribed = false;
+    save();
     (g.eventIds || []).forEach((eid) => broadcast(eid));
     return sendJSON(res, 200, db.guests[g.id]);
   }
   if (req.method === 'POST' && p === '/api/sakes') {
-    const s = await readBody(req);
+    const s = pick(await readBody(req), SAKE_FIELDS);
     if (!s.id) return sendJSON(res, 400, { error: 'missing id' });
-    // Guests may add their own surprise pours (adhoc); library sakes are host-only.
-    if (!s.adhoc && !isHost(req)) return sendJSON(res, 401, { error: 'unauthorized' });
+    const existing = db.sakes[s.id];
+    // Library bottles are host-only. A guest's ad-hoc pour may NOT overwrite an existing library bottle.
+    if ((!s.adhoc || (existing && !existing.adhoc)) && !isHost(req)) return sendJSON(res, 401, { error: 'unauthorized' });
+    if (!existing && countBy(db.sakes, () => true) >= MAX_SAKES) return sendJSON(res, 429, { error: 'too_many_sakes' });
     db.sakes[s.id] = { ...db.sakes[s.id], ...s }; save();
     return sendJSON(res, 200, db.sakes[s.id]);
   }
@@ -501,12 +673,14 @@ async function serveStatic(req, res, url) {
   try {
     const data = await readFile(file);
     const type = MIME[extname(file).toLowerCase()] || 'application/octet-stream';
-    res.writeHead(200, { 'Content-Type': type });
+    const headers = { 'Content-Type': type, ...SEC_HEADERS };
+    if (type === MIME['.html']) headers['Content-Security-Policy'] = CSP;
+    res.writeHead(200, headers);
     res.end(data);
   } catch {
     // SPA-ish fallback for unknown non-file routes → index.html
     if (!extname(file)) {
-      try { const html = await readFile(join(ROOT, 'index.html')); res.writeHead(200, { 'Content-Type': MIME['.html'] }); return res.end(html); }
+      try { const html = await readFile(join(ROOT, 'index.html')); res.writeHead(200, { 'Content-Type': MIME['.html'], ...SEC_HEADERS, 'Content-Security-Policy': CSP }); return res.end(html); }
       catch { /* fall through */ }
     }
     res.writeHead(404); res.end('not found');
@@ -515,15 +689,19 @@ async function serveStatic(req, res, url) {
 
 /* ---------- Server ---------- */
 function handleUnsubscribe(req, res, url) {
-  const email = normEmail(url.searchParams.get('e'));
-  let n = 0;
-  if (email) {
-    for (const g of Object.values(db.guests)) if (normEmail(g.email) === email && g.consentMarketing) { g.consentMarketing = false; n++; }
-    if (n) save();
+  // Token-based: only the opaque per-guest token in the emailed link can unsubscribe that guest —
+  // no one can unsubscribe someone else by guessing their email address.
+  const u = url.searchParams.get('u');
+  let done = false;
+  if (u) {
+    for (const g of Object.values(db.guests)) if (g.unsubToken && g.unsubToken === u) { g.consentMarketing = false; g.unsubscribed = true; done = true; }
+    if (done) save();
   }
-  const msg = email ? "You've been unsubscribed. You won't receive further emails." : 'No email specified.';
-  const html = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4efe6;color:#17303f;display:grid;place-items:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:400px;padding:24px"><div style="font-family:Georgia,serif;font-size:26px;color:#024e82">Sake Journey</div><p style="margin-top:16px;font-size:15px;line-height:1.5">${msg}</p></div></body>`;
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  const msg = done
+    ? "You've been unsubscribed. You won't receive further emails from Sake Journey."
+    : 'This unsubscribe link is invalid or has expired.';
+  const html = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4efe6;color:#17303f;display:grid;place-items:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:400px;padding:24px"><div style="font-family:Georgia,serif;font-size:26px;color:#024e82">Sake Journey</div><p style="margin-top:16px;font-size:15px;line-height:1.5">${escHtml(msg)}</p></div></body>`;
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...SEC_HEADERS, 'Content-Security-Policy': CSP });
   res.end(html);
 }
 

@@ -85,7 +85,7 @@ const RATE_WORDS = ['', 'Not for me', 'It’s fine', 'Rather nice', 'Really love
 export function heartsHTML(value = 0, size = '') {
   let h = `<div class="hearts ${size}" role="radiogroup" aria-label="Rating out of five">`;
   for (let i = 1; i <= 5; i++) {
-    h += `<button type="button" data-v="${i}" class="${i <= value ? 'on' : ''}" aria-label="${i} of 5">${ICONS.heart}</button>`;
+    h += `<button type="button" role="radio" aria-checked="${i === value ? 'true' : 'false'}" data-v="${i}" class="${i <= value ? 'on' : ''}" aria-label="${i} of 5 — ${RATE_WORDS[i]}">${ICONS.heart}</button>`;
   }
   return h + '</div>';
 }
@@ -93,7 +93,11 @@ export function wireHearts(container, initial, onChange) {
   let val = initial || 0;
   const wordEl = container.parentElement.querySelector('.rate-word');
   const paint = () => {
-    $$('.hearts button', container).forEach((b) => b.classList.toggle('on', +b.dataset.v <= val));
+    $$('.hearts button', container).forEach((b) => {
+      const v = +b.dataset.v;
+      b.classList.toggle('on', v <= val);
+      b.setAttribute('aria-checked', v === val ? 'true' : 'false');
+    });
     if (wordEl) wordEl.textContent = RATE_WORDS[val] || '';
   };
   container.querySelector('.hearts').addEventListener('click', (e) => {
@@ -109,27 +113,47 @@ export function miniHearts(value = 0) {
 }
 
 /* ---------- Toast ---------- */
-export function toast(msg, ms = 1900) {
+export function toast(msg, ms) {
   const root = $('#toast-root');
   const t = node(`<div class="toast">${esc(msg)}</div>`);
   root.appendChild(t);
-  setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 300); }, ms);
+  // Long enough to read a sentence: scale with length when no explicit duration is given.
+  const dur = ms || Math.max(2400, Math.min(6000, String(msg).length * 55));
+  setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 300); }, dur);
 }
 
-/* ---------- Bottom sheet ---------- */
-export function openSheet(innerHTML, { onClose } = {}) {
+/* ---------- Bottom sheet (modal dialog) ---------- */
+const _focusable = (root) => $$('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', root);
+export function openSheet(innerHTML, { onClose, label = 'Dialog' } = {}) {
   closeSheet();
-  const back = node(`<div class="sheet-backdrop"><div class="sheet"><div class="grabber"></div><div class="sheet-body">${innerHTML}</div></div></div>`);
+  const back = node(`<div class="sheet-backdrop"><div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(label)}" tabindex="-1"><div class="grabber"></div><div class="sheet-body">${innerHTML}</div></div></div>`);
   back.addEventListener('click', (e) => { if (e.target === back) closeSheet(); });
   $('#sheet-root').appendChild(back);
   document.body.style.overflow = 'hidden';
   back._onClose = onClose;
+  // Move focus into the dialog (announces it to screen readers) without popping the keyboard;
+  // trap Tab within it and close on Escape.
+  const dialog = back.querySelector('.sheet');
+  setTimeout(() => dialog.focus(), 0);
+  back._keydown = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeSheet(); return; }
+    if (e.key !== 'Tab') return;
+    const f = _focusable(back); if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === dialog)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  document.addEventListener('keydown', back._keydown);
   return back.querySelector('.sheet-body');
 }
 export function closeSheet() {
   const root = $('#sheet-root');
   const back = root.firstElementChild;
-  if (back) { if (back._onClose) back._onClose(); back.remove(); }
+  if (back) {
+    if (back._keydown) document.removeEventListener('keydown', back._keydown);
+    if (back._onClose) back._onClose();
+    back.remove();
+  }
   document.body.style.overflow = '';
 }
 

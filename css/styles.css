@@ -16,7 +16,7 @@
 
   --ink:           #17303f;   /* deep blue-ink */
   --ink-2:         #4d5f6b;
-  --ink-3:         #8a96a0;
+  --ink-3:         #66727d;   /* muted — darkened to clear WCAG AA (was #8a96a0, ~2.6:1) */
 
   --accent:        #024e82;   /* brand deep blue */
   --accent-2:      #0f6fb0;   /* brighter blue for gradients/links */
@@ -78,9 +78,9 @@
   --line-soft: #e9e0cf;
   --ink:     #33302a;
   --ink-2:   #5f594e;
-  --ink-3:   #8f8676;
-  --accent:  #b06a3c;   /* warm brick / terracotta */
-  --accent-2:#c98a52;
+  --ink-3:   #756c5c;   /* muted — darkened to clear WCAG AA (was #8f8676) */
+  --accent:  #9c5a30;   /* warm brick / terracotta — deepened so white button text clears AA */
+  --accent-2:#8f5426;   /* link/eyebrow text — was #c98a52 (~2.5:1), now ~5.2:1 */
   --accent-ink: #ffffff;
   --plum:    #2f6d8f;
   --rose:    #c15f45;
@@ -102,6 +102,12 @@ html, body { height: 100%; }
 /* Anchor reset so list-rows don't look like blue links */
 a { color: inherit; text-decoration: none; }
 a.list-row, a.list-row:visited { color: var(--ink); }
+
+/* Visible keyboard focus everywhere (mouse/touch taps don't trigger :focus-visible) */
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+input.inp:focus-visible, textarea.inp:focus-visible, select.inp:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
 
 body {
   font-family: var(--font-ui);
@@ -338,7 +344,7 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
 .rate-block { }
 .rate-label { font-size: .82rem; color: var(--ink-3); text-align: center; letter-spacing: .04em; }
 .hearts { display: flex; justify-content: center; gap: 8px; margin: 6px 0; }
-.hearts button { background: none; border: none; cursor: pointer; padding: 6px; color: var(--line); transition: transform .1s, color .2s; }
+.hearts button { background: none; border: none; cursor: pointer; padding: 6px; color: var(--ink-3); transition: transform .1s, color .2s; }
 .hearts button svg { width: 34px; height: 34px; display: block; }
 .hearts button.on { color: var(--rose); }
 .hearts button:active { transform: scale(1.25); }

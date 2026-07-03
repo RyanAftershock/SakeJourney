@@ -19,7 +19,12 @@ const go = (h) => { location.hash = h; };
 
 /* ---------- shared data helpers ---------- */
 async function activeEvent() {
-  const ev = await Events.get(session.activeEventId);
+  let ev = await Events.get(session.activeEventId);
+  if (!ev && session.activeEventId) {
+    // A scanned QR set this event id but it isn't synced yet — pull it before falling back, so we
+    // never silently render a DIFFERENT event and misattribute the guest's ratings to it.
+    try { await Events.syncFromServer(); ev = await Events.get(session.activeEventId); } catch { /* offline */ }
+  }
   return ev || (await Events.all())[0];
 }
 async function guestFor(ev) { return Guests.ensure(ev.id); }
@@ -197,8 +202,8 @@ export async function course(n) {
       </div>
 
       <div class="photo-duo mt-24">
-        <div class="photo-zone" id="zoneBottle">${zoneInner('bottle', rating.photoBottle)}</div>
-        <div class="photo-zone" id="zoneFood">${zoneInner('food', rating.photoFood)}</div>
+        <div class="photo-zone" id="zoneBottle" role="button" tabindex="0" aria-label="Take a photo of the bottle">${zoneInner('bottle', rating.photoBottle)}</div>
+        <div class="photo-zone" id="zoneFood" role="button" tabindex="0" aria-label="Take a photo of the dish">${zoneInner('food', rating.photoFood)}</div>
       </div>
       <div class="photo-caption">One for the bottle — so you can find it again. One for the plate — to keep the memory.</div>
 
@@ -233,6 +238,7 @@ export async function course(n) {
       toast(kind === 'bottle' ? 'Bottle saved ✨' : 'Dish saved ✨');
       maybeAskIdentity(guest);
     };
+    zone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); zone.click(); } };
   };
   wireZone('zoneBottle', 'bottle', 'photoBottle');
   wireZone('zoneFood', 'food', 'photoFood');
@@ -332,7 +338,7 @@ export async function finaleStep(i) {
 
   app().innerHTML = `
     <div class="screen pad-bottom-bar">
-      <div class="topbar"><span style="width:42px"></span><div class="rail">${rail}</div><span style="width:42px"></span></div>
+      <div class="topbar"><button class="iconbtn" id="fback" aria-label="Back">${svg('back')}</button><div class="rail">${rail}</div><span style="width:42px"></span></div>
 
       <div class="center mt-8">
         <div class="pour-index">${i} of ${list.length}</div>
@@ -352,13 +358,16 @@ export async function finaleStep(i) {
       </div>
     </div>
 
-    <div class="actionbar">
+    <div class="actionbar col gap-8">
       <button class="btn primary block" id="next">${i === list.length ? 'See my night' : 'Next'}</button>
+      <button class="linkbtn" id="skipStep">${i === list.length ? 'Skip to my recap' : 'Skip this pour'}</button>
     </div>`;
 
   // First pass: no s2 yet, so hearts start empty and Next waits for a tap (de-anchored).
   // Re-entry: a saved s2 pre-fills and lets them move on without re-rating.
   $('#next').disabled = !rating.s2;
+  $('#fback').onclick = () => go(i === 1 ? '#/finale' : `#/finale/${i - 1}`);
+  $('#skipStep').onclick = () => go(i === list.length ? '#/recap' : `#/finale/${i + 1}`);
   wireHearts($('.hearts-wrap'), rating.s2 || 0, async (v) => {
     await Ratings.save(guest.id, ev.id, sake.id, { s2: v });
     $('#next').disabled = false;
@@ -367,7 +376,7 @@ export async function finaleStep(i) {
     rv.classList.remove('hidden');
     if (rating.s1) {
       const d = v - rating.s1;
-      const word = d > 0 ? `It climbed — nicely done, ${sake.name.split(' ')[0]}.`
+      const word = d > 0 ? `It climbed — nicely done, ${esc(sake.name.split(' ')[0])}.`
                  : d < 0 ? 'Settled back a touch — that’s the night talking.'
                  : 'Rock steady all evening.';
       rv.innerHTML = `<div class="faint" style="font-size:.85rem">Earlier tonight you said ${miniHearts(rating.s1)}</div>
@@ -483,15 +492,14 @@ export async function recap() {
 }
 
 async function roomFavourite(ev) {
-  const all = await Ratings.forEvent(ev.id);
-  const agg = new Map();
-  for (const r of all) {
-    const f = r.s2 || r.s1; if (!f) continue;
-    const a = agg.get(r.sakeId) || { sum: 0, n: 0 };
-    a.sum += f; a.n += 1; agg.set(r.sakeId, a);
-  }
+  // Uses the anonymous server aggregate — no other guest's identity or photos ever reach a guest device.
+  const data = await Net.results(ev.id);
+  const agg = data && data.agg;
+  if (!agg) return null;
   let best = null;
-  for (const [sakeId, a] of agg) {
+  for (const sakeId of Object.keys(agg)) {
+    const a = agg[sakeId];
+    if (!a.n) continue;
     const avg = a.sum / a.n;
     if (!best || avg > best.avg) best = { sakeId, avg, count: a.n };
   }
@@ -509,6 +517,8 @@ export async function history() {
 
   const items = [];
   let name = '', email = Net.guestEmail();
+  // Land any queued offline ratings first so a signed-in journey never hides what's still in the outbox.
+  if (Net.guestToken()) { try { await Net.flushOutbox(); } catch { /* still offline */ } }
   const server = Net.guestToken() ? await Net.guestHistory() : null;
   const loggedIn = !!server;
 
@@ -696,24 +706,43 @@ export async function claim(token) {
   try {
     const data = await Net.guestClaim(token);
     Net.setGuestSession(data.sessionToken, data.email);
-    // Link this device's guest to the account so future ratings aggregate by email.
+    // Bring the returning guest's profile onto this device so a new phone at event #2 keeps their
+    // name + consents (and their recap keeps flowing) instead of resetting to a blank first-timer.
     const g = await Guests.ensure(ev.id);
-    if (g.email !== data.email) { g.email = data.email; g.identified = true; await Guests.save(g); }
+    const canon = data.guest;
+    if (canon && !g.identified) {
+      g.name = canon.name || g.name;
+      g.email = data.email || canon.email || g.email;
+      g.consentMarketing = !!canon.consentMarketing;
+      g.consentPhotoFood = !!canon.consentPhotoFood;
+      g.consentPhotoMe = !!canon.consentPhotoMe;
+      if (canon.consentAt) g.consentAt = canon.consentAt;
+      g.identified = true;
+      await Guests.save(g);
+    } else if (g.email !== data.email) {
+      g.email = data.email; g.identified = true; await Guests.save(g);
+    }
     toast('Signed in ✨');
     go('#/history');
   } catch (e) {
+    const offline = !navigator.onLine || /fetch|network|load failed/i.test(String(e && e.message));
+    const title = offline ? 'Couldn’t reach the server' : 'That link has expired';
+    const sub = offline ? 'Check your connection and try again — your link is still valid.' : 'Sign-in links last 15 minutes.';
     app().innerHTML = `
       <div class="screen">
         <div class="topbar"><button class="iconbtn" id="back">${svg('back')}</button>
           <span class="eyebrow">Sign in</span><span style="width:42px"></span></div>
         <div class="flex-grow" style="display:grid;place-items:center">
           <div class="empty"><div class="glyph">🍶</div>
-            <div class="serif" style="font-size:1.15rem;color:var(--ink-2)">That link has expired</div>
-            <div class="faint">Sign-in links last 15 minutes.</div>
-            <a class="btn primary mt-24" href="#/login">Get a new link</a></div>
+            <div class="serif" style="font-size:1.15rem;color:var(--ink-2)">${title}</div>
+            <div class="faint">${sub}</div>
+            ${offline
+              ? `<button class="btn primary mt-24" id="retry">Try again</button>`
+              : `<a class="btn primary mt-24" href="#/login">Get a new link</a>`}</div>
         </div>
       </div>`;
     $('#back').onclick = () => go('#/');
+    if ($('#retry')) $('#retry').onclick = () => claim(token);
   }
 }
 
@@ -724,7 +753,7 @@ async function openAddSake(ev, guest) {
   const body = openSheet(`
     <h2 class="serif" style="font-size:1.6rem">A surprise pour</h2>
     <p class="muted" style="font-size:.92rem;margin:4px 0 16px">Kana - Sake Journey poured something off-menu? Capture it and add it to your night.</p>
-    <div class="photo-zone" id="spPhoto" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the bottle</span></div></div>
+    <div class="photo-zone" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the bottle</span></div></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
       <input class="inp" id="spName" placeholder="e.g. Dassai 45, or ‘the cloudy one’"></label>
     <div class="rate-block center card" style="background:var(--surface)">
@@ -737,10 +766,12 @@ async function openAddSake(ev, guest) {
   `);
 
   let photo = null, score = 0;
-  body.querySelector('#spPhoto').onclick = async () => {
+  const spZone = body.querySelector('#spPhoto');
+  spZone.onclick = async () => {
     const d = await pickPhoto(); if (!d) return; photo = d;
-    body.querySelector('#spPhoto').innerHTML = `<img src="${d}" alt="">`;
+    spZone.innerHTML = `<img src="${d}" alt="">`;
   };
+  spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
   wireHearts(body.querySelector('.hearts-wrap'), 0, (v) => (score = v));
   body.querySelector('#spCancel').onclick = () => closeSheet();
   body.querySelector('#spSave').onclick = async () => {
