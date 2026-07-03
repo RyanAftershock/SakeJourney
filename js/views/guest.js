@@ -60,6 +60,65 @@ async function ratedList(ev, guest) {
   return out;
 }
 
+/** If this guest has engaged with PAST events (any night but tonight), returns a warm welcome-back
+    context — their name, how many nights they've shared, and the pour they loved most. Layered
+    recognition: uses the signed-in cross-device history when available, else this device's local
+    ratings. Returns null for a first-timer (nothing to welcome back to). */
+async function returningContext(ev, guest) {
+  let name = guest.name || '';
+  let ratings = [], eventsById = {}, sakesById = {};
+  // Bound the cross-device fetch so a stalled venue connection can't hang the home render (mirrors the
+  // 3s cap in initStore); on timeout we fall back to this device's local ratings.
+  const server = Net.guestToken()
+    ? await Promise.race([Net.guestHistory(), new Promise((r) => setTimeout(() => r(null), 3000))])
+    : null;
+  if (server) {                                      // cross-device: everything for this email
+    name = (server.guest && server.guest.name) || name;
+    ratings = server.ratings || [];
+    eventsById = Object.fromEntries((server.events || []).map((e) => [e.id, e]));
+    sakesById = Object.fromEntries((server.sakes || []).map((s) => [s.id, s]));
+  } else {                                           // this device: the guest's own past ratings
+    for (const eid of (guest.eventIds || [])) {
+      if (eid === ev.id) continue;
+      ratings.push(...await Ratings.forGuestEvent(guest.id, eid));
+    }
+  }
+  const past = ratings.filter((r) => r.eventId !== ev.id && engaged(r));
+  const nights = new Set(past.map((r) => r.eventId));
+  if (!nights.size) return null;
+
+  const scored = past
+    .map((r) => ({ r, final: r.s2 || r.s1 || 0 }))
+    .sort((a, b) => b.final - a.final || (b.r.wouldBuy - a.r.wouldBuy));
+  const topR = scored[0].r;
+  const sake = sakesById[topR.sakeId] || await Sakes.get(topR.sakeId);
+  const lastEvent = eventsById[topR.eventId] || await Events.get(topR.eventId);
+  return {
+    name: name ? esc(name.split(' ')[0]) : '',
+    nights: nights.size,
+    favSake: sake ? sake.name : null,
+    favScore: scored[0].final,
+    lastEventTitle: lastEvent ? lastEvent.title : null,
+  };
+}
+
+function welcomeBackCard(b) {
+  const line = b.favSake
+    ? `Last time${b.lastEventTitle ? ' at ' + esc(b.lastEventTitle) : ''}, you loved <b>${esc(b.favSake)}</b> ${miniHearts(b.favScore)}.`
+    : `Lovely to have you back for another evening.`;
+  return `
+    <div class="card mt-8" style="border-color:color-mix(in srgb,var(--accent) 32%,transparent);background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 8%,transparent),transparent)">
+      <div class="row gap-12" style="align-items:flex-start">
+        <span style="color:var(--accent);flex:none;line-height:0;margin-top:2px">${svg('sparkle')}</span>
+        <div style="flex:1;min-width:0">
+          <div class="eyebrow" style="color:var(--accent)">Welcome back${b.name ? ', ' + b.name : ''}</div>
+          <div style="font-size:.95rem;margin-top:3px;line-height:1.45">${line}</div>
+          <button class="linkbtn" id="wbHistory" style="padding:8px 0 0">Your ${b.nights === 1 ? 'last night' : b.nights + ' nights'} with us — see your journey →</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 /* ============================================================
    HOME — tonight's journey
    ============================================================ */
@@ -67,6 +126,7 @@ export async function home() {
   const ev = await activeEvent();
   applyTheme(session.theme || ev.theme);
   const guest = await guestFor(ev);
+  const back = await returningContext(ev, guest);
   const progress = await Ratings.forGuestEvent(guest.id, ev.id);
   const doneCount = progress.filter(engaged).length;
   const started = doneCount > 0;
@@ -94,6 +154,8 @@ export async function home() {
         <a class="brand" href="#/"><span class="brand-logo" role="img" aria-label="Sake Journey"></span></a>
         <button class="iconbtn" id="toHost" aria-label="Host tools">${svg('users')}</button>
       </div>
+
+      ${back ? welcomeBackCard(back) : ''}
 
       <div class="center mt-8">
         <div class="eyebrow">${esc(fmtDate(ev.date))} · ${esc(ev.venue)}</div>
@@ -127,6 +189,7 @@ export async function home() {
 
   $('#toHost').onclick = () => go('#/host');
   $('#toHistory').onclick = () => go('#/history');
+  if ($('#wbHistory')) $('#wbHistory').onclick = () => go('#/history');
   $('#addSurprise').onclick = () => openAddSake(ev, guest);
   $('#begin').onclick = () => {
     const next = ev.courses.findIndex((c) => !progress.find((r) => r.sakeId === c.sakeId && engaged(r)));
