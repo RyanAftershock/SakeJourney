@@ -635,7 +635,9 @@ async function collectJourney(ev, guest, { localOnly = false } = {}) {
 /** A past pour the guest loved that's in the same flavour family as tonight's sake — the "you loved
     a junmai ginjo like this at the Jazz night" moment. Curated sakes only (real type4), other events. */
 function bestPastMatch(items, s, ev) {
-  if (!s || !s.type4 || s.adhoc) return null;
+  // The course placeholder sake (unassigned / deleted library sake) has a type4 but no id — bail so
+  // we never claim "you loved a similar sake" on a "Sake to be assigned" course.
+  if (!s || !s.id || !s.type4 || s.adhoc) return null;
   const cand = items.filter((it) =>
     it.event.id !== ev.id && it.sake && !it.sake.adhoc &&
     it.sake.id !== s.id && it.sake.type4 === s.type4 && it.final >= 4);
