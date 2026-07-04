@@ -861,8 +861,29 @@ async function editNote(rating) {
 }
 
 /* ============================================================
-   Sign in (email magic-link) — see your journey on any device
+   Sign in (email magic-link, or festival password) — journey on any device
    ============================================================ */
+
+/** Attach a signed-in session to this device and bring the returning guest's profile onto it
+    (name + consents), so a new device keeps them instead of resetting to a blank first-timer. */
+async function applySignIn(ev, data) {
+  Net.setGuestSession(data.sessionToken, data.email);
+  const g = await Guests.ensure(ev.id);
+  const canon = data.guest;
+  if (canon && !g.identified) {
+    g.name = canon.name || g.name;
+    g.email = data.email || canon.email || g.email;
+    g.consentMarketing = !!canon.consentMarketing;
+    g.consentPhotoFood = !!canon.consentPhotoFood;
+    g.consentPhotoMe = !!canon.consentPhotoMe;
+    if (canon.consentAt) g.consentAt = canon.consentAt;
+    g.identified = true;
+    await Guests.save(g);
+  } else if (g.email !== data.email) {
+    g.email = data.email; g.identified = true; await Guests.save(g);
+  }
+}
+
 export async function login() {
   const ev = await activeEvent();
   applyTheme(session.theme || ev.theme);
@@ -878,10 +899,29 @@ export async function login() {
           <input class="inp" id="loginEmail" type="email" placeholder="you@example.com" style="text-align:center" value="${esc(Net.guestEmail())}" autocomplete="email">
           <button class="btn primary block mt-16" id="loginSend">Email me a link</button>
           <div id="loginMsg" class="faint mt-16" style="font-size:.85rem;line-height:1.5"></div>
+          <div id="pwWrap" class="hidden mt-16">
+            <input class="inp" id="pwField" type="password" placeholder="Festival password" autocomplete="current-password" style="text-align:center">
+            <button class="btn primary block mt-8" id="pwSend">Sign in with password</button>
+          </div>
+          <button class="linkbtn" id="toPassword" style="display:block;margin:14px auto 0;font-size:.82rem">Have a festival password? Sign in with it →</button>
         </div>
       </div>
     </div>`;
   $('#back').onclick = () => go('#/history');
+  $('#toPassword').onclick = () => { $('#pwWrap').classList.remove('hidden'); $('#pwField').focus(); };
+  const pwSubmit = async () => {
+    const email = $('#loginEmail').value.trim();
+    if (!email.includes('@')) { toast('Enter your email first'); $('#loginEmail').focus(); return; }
+    const btn = $('#pwSend'); btn.disabled = true; btn.textContent = 'Signing in…';
+    try {
+      const data = await Net.guestPasswordLogin(email, $('#pwField').value);
+      await applySignIn(ev, data);
+      toast('Signed in ✨');
+      go('#/history');
+    } catch (e) { btn.disabled = false; btn.textContent = 'Sign in with password'; toast(e.message, 3000); }
+  };
+  $('#pwSend').onclick = pwSubmit;
+  $('#pwField').addEventListener('keydown', (e) => { if (e.key === 'Enter') pwSubmit(); });
   const send = async () => {
     const email = $('#loginEmail').value.trim();
     if (!email.includes('@')) { toast('Enter a valid email'); return; }
@@ -903,23 +943,7 @@ export async function claim(token) {
   app().innerHTML = `<div class="screen"><div class="flex-grow" style="display:grid;place-items:center"><div class="empty"><div class="glyph">🍶</div>Signing you in…</div></div></div>`;
   try {
     const data = await Net.guestClaim(token);
-    Net.setGuestSession(data.sessionToken, data.email);
-    // Bring the returning guest's profile onto this device so a new phone at event #2 keeps their
-    // name + consents (and their recap keeps flowing) instead of resetting to a blank first-timer.
-    const g = await Guests.ensure(ev.id);
-    const canon = data.guest;
-    if (canon && !g.identified) {
-      g.name = canon.name || g.name;
-      g.email = data.email || canon.email || g.email;
-      g.consentMarketing = !!canon.consentMarketing;
-      g.consentPhotoFood = !!canon.consentPhotoFood;
-      g.consentPhotoMe = !!canon.consentPhotoMe;
-      if (canon.consentAt) g.consentAt = canon.consentAt;
-      g.identified = true;
-      await Guests.save(g);
-    } else if (g.email !== data.email) {
-      g.email = data.email; g.identified = true; await Guests.save(g);
-    }
+    await applySignIn(ev, data);
     toast('Signed in ✨');
     go('#/history');
   } catch (e) {

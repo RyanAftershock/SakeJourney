@@ -33,6 +33,12 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.FROM_EMAIL || 'Sake Journey <onboarding@resend.dev>';
 const PUBLIC_URL = process.env.PUBLIC_URL || '';   // override for links in emails (else derived from request)
 
+// Festival trial: a small allow-list of emails that can sign in with a shared password instead of a
+// magic link (for a hands-on trial day). Both configurable via env; set FESTIVAL_EMAILS='' to disable.
+const FESTIVAL_PASSCODE = process.env.FESTIVAL_PASSCODE || 'Kanpai';
+const FESTIVAL_EMAILS = new Set((process.env.FESTIVAL_EMAILS ?? 'ryanmerrett@gmail.com,jimbeam999@hotmail.com')
+  .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean));
+
 const GRADE_ENUM = ['', 'junmai', 'junmai_ginjo', 'junmai_daiginjo', 'ginjo', 'daiginjo', 'honjozo', 'nigori', 'sparkling', 'koshu'];
 const MENU_SCHEMA = {
   type: 'object', additionalProperties: false,
@@ -494,6 +500,26 @@ async function handleAPI(req, res, url) {
     // valid token back over the API — otherwise anyone could claim any email.
     if (!PUBLIC_URL) return sendJSON(res, 200, { ok: true, sent: false, hasAccount, devLink: link });
     return sendJSON(res, 200, { ok: true, sent: false, hasAccount, error: 'email_not_configured' });
+  }
+
+  // Festival trial: an allow-listed email signs in with the shared password (no magic link) and gets
+  // the same guest session token a magic-link claim would issue.
+  if (req.method === 'POST' && p === '/api/guest/password-login') {
+    if (!rateLimit('gpl:' + clientIp(req), 20, 10 * 60 * 1000)) return sendJSON(res, 429, { error: 'too_many_requests' });
+    const b = await readBody(req);
+    const email = normEmail(b.email);
+    if (!email.includes('@')) return sendJSON(res, 400, { error: 'bad_email' });
+    if (!FESTIVAL_EMAILS.has(email) || !timingSafeEqualStr(String(b.password || ''), FESTIVAL_PASSCODE))
+      return sendJSON(res, 401, { error: 'invalid_login' });
+    let guest = canonicalGuest(email);
+    if (!guest) {
+      guest = { id: 'g_' + rid(6).slice(0, 8), name: '', email, consentMarketing: false, consentPhotoFood: false, consentPhotoMe: false, eventIds: [], createdAt: Date.now(), identified: true };
+      db.guests[guest.id] = guest;
+    }
+    const sessionToken = rid(24);
+    db.guestTokens[sessionToken] = { email, createdAt: Date.now(), exp: Date.now() + 90 * 24 * 60 * 60 * 1000 };
+    save();
+    return sendJSON(res, 200, { sessionToken, email, guest });
   }
 
   // Claim a magic-link token → returns a session token + the guest for that email.
