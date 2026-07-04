@@ -6,6 +6,7 @@
    ============================================================ */
 
 import { Events, Sakes, Guests, Ratings, session, uid } from '../store.js';
+import { SOLO_EVENT } from '../seed.js';
 import * as Net from '../net.js';
 import {
   $, $$, node, esc, svg, gradeLabel, quadrantHTML, quadLegend, tempHTML,
@@ -25,7 +26,9 @@ async function activeEvent() {
     // never silently render a DIFFERENT event and misattribute the guest's ratings to it.
     try { await Events.syncFromServer(); ev = await Events.get(session.activeEventId); } catch { /* offline */ }
   }
-  return ev || (await Events.all())[0];
+  if (ev) return ev;
+  const all = await Events.all();
+  return all.find((e) => !e.personal) || all[0];   // never fall back to the personal journal as "tonight"
 }
 async function guestFor(ev) { return Guests.ensure(ev.id); }
 
@@ -33,8 +36,9 @@ async function guestFor(ev) { return Guests.ensure(ev.id); }
 const photoOf = (r) => (r && (r.photoBottle || r.photoFood || r.photo)) || null;
 const hasPhoto = (r) => !!(r && (r.photoBottle || r.photoFood || r.photo));
 
-/** Has the guest engaged with this pour at all? (rated, photographed, or wants a bottle) */
-const engaged = (r) => !!(r && (r.s1 || r.s2 || r.photoBottle || r.photoFood || r.photo || r.wouldBuy));
+/** Has the guest engaged with this pour at all? (rated, photographed, wants a bottle, or explicitly
+    logged it themselves — a solo journal entry counts even with no score yet). */
+const engaged = (r) => !!(r && (r.s1 || r.s2 || r.photoBottle || r.photoFood || r.photo || r.wouldBuy || r.logged));
 
 /** All sakes this guest has engaged with (course pours first, then surprise pours).
     Skips any sake whose record is gone (e.g. deleted from the library) so downstream
@@ -182,9 +186,9 @@ export async function home() {
       <button class="linkbtn" id="toHistory" style="display:block;margin:14px auto 0">Your sake journey — every pour you’ve tasted →</button>
     </div>
 
-    <div class="actionbar">
-      <button class="iconbtn accent" id="addSurprise" aria-label="Add a surprise pour">${svg('plus')}</button>
+    <div class="actionbar col gap-8">
       <button class="btn primary block" id="begin">${started ? 'Continue tasting' : 'Begin the journey'}</button>
+      <button class="btn subtle block" id="addSurprise">${svg('plus')} Add a pour that’s not on the menu</button>
     </div>`;
 
   $('#toHost').onclick = () => go('#/host');
@@ -577,6 +581,7 @@ async function roomFavourite(ev) {
 export async function history() {
   const ev = await activeEvent();
   applyTheme(session.theme || ev.theme);
+  const guest = await guestFor(ev);          // this device's guest — for logging a sake on your own
 
   const items = [];
   let name = '', email = Net.guestEmail();
@@ -598,7 +603,6 @@ export async function history() {
       items.push({ sake, rating: r, event: e, course, final: r.s2 || r.s1 || 0 });
     }
   } else {                                          // local: this device's guest
-    const guest = await guestFor(ev);
     name = guest.name; email = guest.email;
     for (const eid of (guest.eventIds || [])) {
       const e = await Events.get(eid);
@@ -628,10 +632,12 @@ export async function history() {
             <div class="serif" style="font-size:1.2rem;color:var(--ink-2)">Your journey starts tonight</div>
             <div class="faint">Taste a pour and it’ll live here — with your score, photo and notes.</div>
             <a class="btn primary mt-24" href="#/">See tonight’s menu</a>
+            <button class="btn subtle block mt-8" id="logSake">${svg('plus')} Log a sake you’re tasting</button>
             ${loggedIn ? '' : `<button class="linkbtn mt-16" id="toLogin">Been before? Sign in to see your journey →</button>`}</div>
         </div>
       </div>`;
     $('#back').onclick = () => go('#/');
+    if ($('#logSake')) $('#logSake').onclick = () => openAddSake(SOLO_EVENT, guest, { solo: true });
     if ($('#toLogin')) $('#toLogin').onclick = () => go('#/login');
     return;
   }
@@ -648,8 +654,11 @@ export async function history() {
   for (const it of items) {
     if (it.event.id !== lastEvent) {
       lastEvent = it.event.id;
+      const sub = it.event.personal
+        ? esc(it.event.subtitle || '')
+        : esc(fmtDate(it.event.date)) + (it.event.venue ? ' · ' + esc(it.event.venue) : '');
       rows += `<div class="divider"><span class="k">${esc(it.event.title)}</span></div>
-        <div class="faint center" style="font-size:.78rem;margin:-10px 0 14px">${esc(fmtDate(it.event.date))}${it.event.venue ? ' · ' + esc(it.event.venue) : ''}</div>`;
+        <div class="faint center" style="font-size:.78rem;margin:-10px 0 14px">${sub}</div>`;
     }
     const r = it.rating;
     rows += `
@@ -659,7 +668,7 @@ export async function history() {
           <div style="flex:1;min-width:0">
             <div class="sake-sub" style="font-family:var(--font-jp)">${esc(it.sake.romaji || '')}</div>
             <div class="serif" style="font-size:1.15rem">${esc(it.sake.name)}</div>
-            <div class="faint" style="font-size:.8rem">${it.course ? esc(it.course.name) : 'Surprise pour'} · ${gradeLabel(it.sake.grade)}</div>
+            <div class="faint" style="font-size:.8rem">${it.course ? esc(it.course.name) : (it.event.personal ? 'Your own tasting' : 'Surprise pour')} · ${gradeLabel(it.sake.grade)}</div>
           </div>
           <div class="col" style="align-items:flex-end;gap:6px">
             ${miniHearts(it.final)}
@@ -690,6 +699,7 @@ export async function history() {
       ${top && top.final ? `<div class="card glow mt-16 center"><div class="eyebrow">Your highest pour</div>
         <h2 class="sake-name" style="font-size:1.4rem;margin-top:6px">${esc(top.sake.name)}</h2>
         <div class="muted">${miniHearts(top.final)}</div></div>` : ''}
+      <button class="btn subtle block mt-16" id="logSake">${svg('plus')} Log a sake you’re tasting</button>
       <div class="mt-16">${rows}</div>
       ${loggedIn
         ? `<p class="faint center mt-24" style="font-size:.8rem">Signed in as ${esc(email)} · <button class="linkbtn" id="logout" style="padding:0;font-size:.8rem">Sign out</button></p>`
@@ -697,6 +707,7 @@ export async function history() {
     </div>`;
 
   $('#back').onclick = () => go('#/');
+  if ($('#logSake')) $('#logSake').onclick = () => openAddSake(SOLO_EVENT, guest, { solo: true });
   if ($('#toLogin')) $('#toLogin').onclick = () => go('#/login');
   if ($('#logout')) $('#logout').onclick = () => { Net.setGuestSession(null); toast('Signed out'); history(); };
   $$('.note-btn').forEach((b) => (b.onclick = () => editNote(items[+b.dataset.idx].rating)));
@@ -812,27 +823,32 @@ export async function claim(token) {
 /* ============================================================
    Surprise pour (+)  —  add & rate an off-menu sake
    ============================================================ */
-async function openAddSake(ev, guest) {
+async function openAddSake(ev, guest, { solo = false } = {}) {
+  const heading = solo ? 'Log a sake' : 'A surprise pour';
+  const intro = solo
+    ? 'Tasting a sake anywhere — a bar, a bottle at home? Capture it and keep it in your journey.'
+    : `${esc(ev.host || 'Your host')} poured something off-menu? Capture it and add it to your night.`;
+  const namePh = solo ? 'e.g. Dassai 45, or ‘the one at the izakaya’' : 'e.g. Dassai 45, or ‘the cloudy one’';
   const body = openSheet(`
-    <h2 class="serif" style="font-size:1.6rem">A surprise pour</h2>
-    <p class="muted" style="font-size:.92rem;margin:4px 0 16px">Kana - Sake Journey poured something off-menu? Capture it and add it to your night.</p>
+    <h2 class="serif" style="font-size:1.6rem">${heading}</h2>
+    <p class="muted" style="font-size:.92rem;margin:4px 0 16px">${intro}</p>
     <div class="photo-zone" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the bottle</span></div></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
-      <input class="inp" id="spName" placeholder="e.g. Dassai 45, or ‘the cloudy one’"></label>
+      <input class="inp" id="spName" placeholder="${namePh}"></label>
     <div class="rate-block center card" style="background:var(--surface)">
       <div class="rate-label">First impression</div>
       <div class="hearts-wrap">${heartsHTML(0)}</div>
       <div class="rate-word"></div>
     </div>
-    <button class="btn primary block mt-16" id="spSave">Add to my night</button>
+    <button class="btn primary block mt-16" id="spSave">${solo ? 'Save to my journey' : 'Add to my night'}</button>
     <button class="linkbtn" id="spCancel" style="display:block;margin:8px auto 0">Cancel</button>
-  `);
+  `, { label: heading });
 
   let photo = null, score = 0;
   const spZone = body.querySelector('#spPhoto');
   spZone.onclick = async () => {
     const d = await pickPhoto(); if (!d) return; photo = d;
-    spZone.innerHTML = `<img src="${d}" alt="">`;
+    spZone.innerHTML = `<img src="${esc(d)}" alt="">`;
   };
   spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
   wireHearts(body.querySelector('.hearts-wrap'), 0, (v) => (score = v));
@@ -840,18 +856,25 @@ async function openAddSake(ev, guest) {
   body.querySelector('#spSave').onclick = async () => {
     const name = body.querySelector('#spName').value.trim();
     if (!name && !photo) { toast('Add a name or a photo'); return; }
+    // A solo pour attaches to this device's guest and the personal journal — make sure both exist.
+    if (solo) guest = await Guests.ensure(SOLO_EVENT.id);
     const s = {
-      id: uid('s'), name: name || 'Surprise pour', romaji: '', brewery: 'Off-menu', region: '',
+      id: uid('s'), name: name || (solo ? 'A sake' : 'Surprise pour'), romaji: '', brewery: solo ? '' : 'Off-menu', region: '',
       grade: '', type4: 'junshu', temp: 'joon', smv: '', acidity: '', abv: '', seimai: '',
-      profile: 'A spontaneous pour, added at the table.', tags: ['surprise'],
+      profile: solo ? 'A sake you logged on your own.' : 'A spontaneous pour, added at the table.',
+      tags: solo ? ['solo'] : ['surprise'],
       adhoc: true, eventId: ev.id, addedBy: guest.id,
     };
     await Sakes.save(s);
-    await Ratings.save(guest.id, ev.id, s.id, { s1: score || null, photoBottle: photo });
+    const patch = { s1: score || null, photoBottle: photo };
+    if (solo) patch.logged = true;   // a named solo entry counts even without a score
+    await Ratings.save(guest.id, ev.id, s.id, patch);
     closeSheet();
     toast(`Added “${s.name}” ✨`);
     maybeAskIdentity(guest);
-    if ((location.hash || '').startsWith('#/recap') || location.hash.startsWith('#/finale')) go('#/recap'); else home();
+    if (solo) history();
+    else if ((location.hash || '').startsWith('#/recap') || location.hash.startsWith('#/finale')) go('#/recap');
+    else home();
   };
 }
 
