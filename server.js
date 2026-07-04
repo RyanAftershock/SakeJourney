@@ -104,6 +104,7 @@ Rules:
   · Y axis 0–100: 0 = highly aromatic/fragrant; 100 = quiet, subdued aroma.
   · type4 quadrant: kunshu = aromatic & light (x<50, y<50); soshu = quiet & light (x<50, y>50); junshu = quiet & rich (x>50, y>50); jukushu = aromatic & rich (x>50, y<50).
   Put expertX/expertY at the point that best represents this sake's known style and set type4 to the matching quadrant.
+- smv / acidity / abv / seimai: the bare value only (e.g. "+4", "1.4", "16%", "45%") — no ranges with commentary, no parentheticals. If sources disagree, pick the current official value.
 - about: 2–4 plain sentences (no markup) of the most useful public info — brewery/region, style, signature notes, food pairings, awards.
 - sources: up to 4 short labels for where the info came from (e.g. "brewery site", "a domain name"). Do not include full URLs.
 - profile: one evocative sentence for how it tastes. tags: 3–6 short flavour/style words.
