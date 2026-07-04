@@ -6,7 +6,7 @@
    ============================================================ */
 
 import { Events, Sakes, Guests, Ratings, session, uid } from '../store.js';
-import { SOLO_EVENT } from '../seed.js';
+import { SOLO_EVENT, TYPE4 } from '../seed.js';
 import * as Net from '../net.js';
 import {
   $, $$, node, esc, svg, gradeLabel, quadrantHTML, quadLegend, tempHTML,
@@ -218,6 +218,10 @@ export async function course(n) {
   };
   let rating = (await Ratings.get(guest.id, ev.id, c.sakeId)) || {};
   const last = n === ev.courses.length;
+  // "You loved a junmai ginjo like this at the Jazz night" — a past pour in the same flavour family.
+  // Device-local only, so the tasting flow never waits on the network.
+  const { items: myJourney } = await collectJourney(ev, guest, { localOnly: true });
+  const pastLove = bestPastMatch(myJourney, s, ev);
 
   const rail = ev.courses.map((_, i) =>
     `<span class="dot ${i + 1 < n ? 'done' : ''} ${i + 1 === n ? 'now' : ''}"></span>`).join('');
@@ -245,6 +249,10 @@ export async function course(n) {
           ${quadrantHTML(s.type4)}
           ${quadLegend(s.type4)}
         </div>
+        ${pastLove ? `<div class="mt-12" style="background:color-mix(in srgb,var(--accent) 9%,transparent);border:1px solid color-mix(in srgb,var(--accent) 22%,transparent);border-radius:12px;padding:10px 12px;font-size:.9rem;line-height:1.42;display:flex;gap:8px;align-items:flex-start">
+          <span style="color:var(--accent);flex:none;line-height:0;margin-top:1px">${svg('sparkle')}</span>
+          <div>You loved <b>${esc(pastLove.sakeName)}</b> at ${esc(pastLove.eventTitle)}${pastLove.grade === s.grade ? ' — a similar ' + esc(gradeLabel(s.grade)) : ' — a similar style'}. ${miniHearts(pastLove.final)}</div>
+        </div>` : ''}
         ${s.profile ? `<p class="profile-line mt-16">“${esc(s.profile)}”</p>` : ''}
         <div class="specs mt-16">
           ${spec('SMV', (s.smv === '' || s.smv == null) ? '–' : (s.smv > 0 ? '+' + s.smv : s.smv))}
@@ -579,20 +587,22 @@ async function roomFavourite(ev) {
 /* ============================================================
    MY JOURNEY — every sake this guest has tasted, across all events
    ============================================================ */
-export async function history() {
-  const ev = await activeEvent();
-  applyTheme(session.theme || ev.theme);
-  const guest = await guestFor(ev);          // this device's guest — for logging a sake on your own
+/* ============================================================
+   Repeat-attendee intelligence — cross-event journey helpers
+   ============================================================ */
 
+/** The guest's full journey — every engaged pour with its sake + event, newest first. Layered:
+    signed-in cross-device history (bounded 3s so a stalled connection can't hang) when available,
+    else this device's local ratings. localOnly skips the network entirely (tasting hot path). */
+async function collectJourney(ev, guest, { localOnly = false } = {}) {
   const items = [];
-  let name = '', email = Net.guestEmail();
-  // Land any queued offline ratings first so a signed-in journey never hides what's still in the outbox.
-  if (Net.guestToken()) { try { await Net.flushOutbox(); } catch { /* still offline */ } }
-  const server = Net.guestToken() ? await Net.guestHistory() : null;
-  const loggedIn = !!server;
-
-  if (loggedIn) {                                   // cross-device: everything for this email
-    name = (server.guest && server.guest.name) || '';
+  let name = guest.name || '', email = guest.email || Net.guestEmail(), loggedIn = false;
+  const server = (!localOnly && Net.guestToken())
+    ? await Promise.race([Net.guestHistory(), new Promise((r) => setTimeout(() => r(null), 3000))])
+    : null;
+  if (server) {                                    // cross-device: everything for this email
+    loggedIn = true;
+    name = (server.guest && server.guest.name) || name;
     email = server.email || email;
     const eventsById = Object.fromEntries((server.events || []).map((e) => [e.id, e]));
     const sakesById = Object.fromEntries((server.sakes || []).map((s) => [s.id, s]));
@@ -603,13 +613,11 @@ export async function history() {
       const course = (e.courses || []).find((c) => c.sakeId === r.sakeId) || null;
       items.push({ sake, rating: r, event: e, course, final: r.s2 || r.s1 || 0 });
     }
-  } else {                                          // local: this device's guest
-    name = guest.name; email = guest.email;
+  } else {                                         // local: this device's guest
     for (const eid of (guest.eventIds || [])) {
       const e = await Events.get(eid);
       if (!e) continue;
-      const ratings = await Ratings.forGuestEvent(guest.id, eid);
-      for (const r of ratings) {
+      for (const r of await Ratings.forGuestEvent(guest.id, eid)) {
         if (!engaged(r)) continue;
         const sake = await Sakes.get(r.sakeId);
         if (!sake) continue;
@@ -618,10 +626,119 @@ export async function history() {
       }
     }
   }
-  // newest event first, then course order within an event
   items.sort((a, b) => a.event.id === b.event.id
     ? (a.course?.order || 99) - (b.course?.order || 99)
     : (b.event.date || '').localeCompare(a.event.date || ''));
+  return { items, name, email, loggedIn };
+}
+
+/** A past pour the guest loved that's in the same flavour family as tonight's sake — the "you loved
+    a junmai ginjo like this at the Jazz night" moment. Curated sakes only (real type4), other events. */
+function bestPastMatch(items, s, ev) {
+  if (!s || !s.type4 || s.adhoc) return null;
+  const cand = items.filter((it) =>
+    it.event.id !== ev.id && it.sake && !it.sake.adhoc &&
+    it.sake.id !== s.id && it.sake.type4 === s.type4 && it.final >= 4);
+  if (!cand.length) return null;
+  cand.sort((a, b) => b.final - a.final || (b.event.date || '').localeCompare(a.event.date || ''));
+  const w = cand[0];
+  return { sakeName: w.sake.name, grade: w.sake.grade, final: w.final, eventTitle: w.event.title };
+}
+
+/** Would-buy sakes across every event, deduped by sake (best score kept), highest first. */
+function dedupeWants(list) {
+  const byName = new Map();
+  for (const it of list) {
+    const k = (it.sake.name || '').trim().toLowerCase();
+    const prev = byName.get(k);
+    if (!prev || it.final > prev.final) byName.set(k, it);
+  }
+  return [...byName.values()].sort((a, b) => b.final - a.final);
+}
+
+/** Weighted centroid of the guest's palate on the four-type quadrant, from curated sakes they rated
+    (weighted by score); plus a drift between their earliest and latest event. null if too little data. */
+function tastePalette(items) {
+  const real = items.filter((it) => it.sake && !it.sake.adhoc && TYPE4[it.sake.type4] && it.final > 0);
+  if (real.length < 3) return null;
+  const centroid = (list) => {
+    let sx = 0, sy = 0, w = 0;
+    for (const it of list) { const q = TYPE4[it.sake.type4]; sx += q.x * it.final; sy += q.y * it.final; w += it.final; }
+    return w ? { x: sx / w, y: sy / w } : null;
+  };
+  const all = centroid(real);
+  const key = all.x < 50 ? (all.y < 50 ? 'kunshu' : 'soshu') : (all.y < 50 ? 'jukushu' : 'junshu');
+  const t = TYPE4[key];
+  let drift = null, from = null;
+  const byDate = real.slice().sort((a, b) => (a.event.date || '').localeCompare(b.event.date || ''));
+  const firstEid = byDate[0].event.id, lastEid = byDate[byDate.length - 1].event.id;
+  if (firstEid !== lastEid) {
+    const early = centroid(real.filter((it) => it.event.id === firstEid));
+    const late = centroid(real.filter((it) => it.event.id === lastEid));
+    if (early && late) {
+      from = early;
+      const dx = late.x - early.x, dy = late.y - early.y, parts = [];
+      if (Math.abs(dx) >= 6) parts.push(dx > 0 ? 'richer' : 'lighter');
+      if (Math.abs(dy) >= 6) parts.push(dy < 0 ? 'more aromatic' : 'quieter');
+      if (parts.length) drift = parts.join(' & ');
+    }
+  }
+  return { x: all.x, y: all.y, typeName: t.name, typeTag: t.tag, drift, from };
+}
+
+/** The four-type quadrant with the guest's own palate dot (and a faint 'earlier' dot when drifting). */
+function paletteQuadHTML(x, y, from) {
+  const dot = (px, py, faint) => `<span class="dot" style="left:${px}%;top:${py}%${faint ? ';opacity:.35;width:11px;height:11px' : ''}"></span>`;
+  return `
+    <div class="quad" role="img" aria-label="Your taste profile on the four-type map">
+      <div class="axis v"></div><div class="axis h"></div>
+      <span class="lbl t">Aromatic</span><span class="lbl b">Quiet</span>
+      <span class="lbl l">Light</span><span class="lbl r">Rich</span>
+      ${from ? dot(from.x, from.y, true) : ''}
+      ${dot(x, y, false)}
+    </div>`;
+}
+
+function takeHomeCardHTML(wants) {
+  if (!wants.length) return '';
+  const rows = wants.map((w) => `
+    <div class="row between" style="padding:9px 0;border-top:1px solid var(--line-soft)">
+      <div style="min-width:0"><div class="serif" style="font-size:1.05rem">${esc(w.sake.name)}</div>
+        <div class="faint" style="font-size:.76rem">${esc(w.event.title)}</div></div>
+      <div style="flex:none">${miniHearts(w.final)}</div>
+    </div>`).join('');
+  return `
+    <div class="card mt-16">
+      <div class="eyebrow" style="color:var(--accent)">${svg('bottle')} Your take-home list</div>
+      <p class="faint" style="font-size:.8rem;margin:4px 0 2px">Bottles you marked to take home, across every night — mention them to your host, or reply to your recap to order.</p>
+      ${rows}
+    </div>`;
+}
+
+function paletteCardHTML(p) {
+  if (!p) return '';
+  return `
+    <div class="card mt-16">
+      <div class="eyebrow" style="color:var(--ink-3)">Your palate</div>
+      <div class="row gap-16 mt-8" style="align-items:center">
+        ${paletteQuadHTML(p.x, p.y, p.from)}
+        <div style="flex:1;min-width:0">
+          <div class="serif" style="font-size:1.2rem">${esc(p.typeName)}</div>
+          <div class="muted" style="font-size:.9rem">${esc(p.typeTag)}</div>
+          ${p.drift ? `<div class="faint" style="font-size:.82rem;margin-top:6px">Lately you’re trending <b style="color:var(--accent-2)">${esc(p.drift)}</b>.</div>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+export async function history() {
+  const ev = await activeEvent();
+  applyTheme(session.theme || ev.theme);
+  const guest = await guestFor(ev);          // this device's guest — for logging a sake on your own
+
+  // Land any queued offline ratings first so a signed-in journey never hides what's still in the outbox.
+  if (Net.guestToken()) { try { await Net.flushOutbox(); } catch { /* still offline */ } }
+  const { items, name, email, loggedIn } = await collectJourney(ev, guest);
 
   if (!items.length) {
     app().innerHTML = `
@@ -646,6 +763,8 @@ export async function history() {
   const eventsSeen = new Set(items.map((i) => i.event.id));
   const buys = items.filter((i) => i.rating.wouldBuy).length;
   const top = items.reduce((best, i) => (i.final > (best ? best.final : 0) ? i : best), null);
+  const wants = dedupeWants(items.filter((i) => i.rating.wouldBuy));
+  const palette = tastePalette(items);
 
   const thumb = (r) => photoOf(r)
     ? `<img src="${photoOf(r)}" style="width:56px;height:56px;border-radius:12px;object-fit:cover;flex:none" alt="">`
@@ -700,6 +819,8 @@ export async function history() {
       ${top && top.final ? `<div class="card glow mt-16 center"><div class="eyebrow">Your highest pour</div>
         <h2 class="sake-name" style="font-size:1.4rem;margin-top:6px">${esc(top.sake.name)}</h2>
         <div class="muted">${miniHearts(top.final)}</div></div>` : ''}
+      ${takeHomeCardHTML(wants)}
+      ${paletteCardHTML(palette)}
       <button class="btn subtle block mt-16" id="logSake">${svg('plus')} Log a sake you’re tasting</button>
       <div class="mt-16">${rows}</div>
       ${loggedIn
