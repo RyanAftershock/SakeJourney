@@ -325,7 +325,9 @@ function sanitizeScan(o = {}) {
 // answer from vision + the model's own knowledge — the graceful fallback if web search is unavailable.
 async function identifySakeImage(mediaType, b64, useSearch) {
   const tools = [];
-  if (useSearch) tools.push({ type: 'web_search_20260209', name: 'web_search' });
+  // Basic (direct) web search — simplest server-tool shape, no code-execution routing; plenty for a
+  // single-bottle lookup. max_uses caps cost/latency. record_sake is the client tool we read back.
+  if (useSearch) tools.push({ type: 'web_search_20250305', name: 'web_search', max_uses: 5 });
   tools.push({ name: 'record_sake', description: 'Record the identified sake and its researched details.', input_schema: SAKE_SCAN_SCHEMA, strict: true });
   const messages = [{
     role: 'user',
