@@ -148,9 +148,13 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
   display: flex;
   flex-direction: column;
   padding: calc(var(--safe-top) + 8px) 20px calc(var(--safe-bottom) + 28px);
-  animation: rise .42s cubic-bezier(.2,.7,.2,1) both;
 }
+/* Entrance animation only on real navigations — live (SSE) re-renders swap the screen in place
+   and would otherwise replay the rise every few seconds as ratings stream in. */
+#app.nav-in .screen { animation: rise .42s cubic-bezier(.2,.7,.2,1) both; }
 .screen.pad-bottom-bar { padding-bottom: calc(var(--safe-bottom) + 108px); }
+/* A two-button actionbar (home) is ~136px tall — reserve enough that nothing hides beneath it. */
+.screen.pad-bottom-bar-2 { padding-bottom: calc(var(--safe-bottom) + 164px); }
 .flex-grow { flex: 1; }
 .row { display: flex; align-items: center; gap: 12px; }
 .row.between { justify-content: space-between; }
@@ -169,6 +173,16 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
   gap: 12px; padding: 6px 2px 14px; position: sticky; top: 0; z-index: 5;
+}
+/* Sticky bars need a floor — without one, content scrolls THROUGH the logo. The ::before extends
+   into the screen's side/top padding and fades out at its lower edge so there's no hard line. */
+.topbar::before {
+  content: ''; position: absolute; z-index: -1;
+  left: -20px; right: -20px; top: calc(-1 * (var(--safe-top) + 8px)); bottom: 0;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  -webkit-backdrop-filter: blur(9px); backdrop-filter: blur(9px);
+  -webkit-mask: linear-gradient(180deg, #000 72%, transparent);
+  mask: linear-gradient(180deg, #000 72%, transparent);
 }
 .topbar .brand { display: flex; align-items: center; gap: 9px; text-decoration: none; }
 .topbar .brand .logo { width: 26px; height: 26px; }
@@ -281,7 +295,7 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
 .venue-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .venue-btn {
   display: inline-flex; align-items: center; gap: 5px; text-decoration: none;
-  padding: 7px 11px; border-radius: 999px; font-size: .8rem; font-weight: 600;
+  padding: 10px 14px; min-height: 42px; border-radius: 999px; font-size: .8rem; font-weight: 600;
   background: var(--surface-2); border: 1px solid var(--line-soft); color: var(--ink-2);
   transition: transform .12s;
 }
@@ -315,8 +329,14 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
 .quad-legend { font-size: .78rem; color: var(--ink-2); }
 .quad-legend b { color: var(--ink); font-family: var(--font-display); font-size: 1rem; }
 
-/* interactive taste matrix — tap to place your own dot next to the expert read */
-.quad.tap { --s: 148px; cursor: crosshair; touch-action: none; }
+/* tiny list-row quads (host library) — axis labels would be unreadable at 52px */
+.quad.mini { flex: none; }
+.quad.mini .lbl { display: none; }
+.quad.mini .dot { width: 9px; height: 9px; box-shadow: none; }
+
+/* interactive taste matrix — tap to place your own dot next to the expert read.
+   touch-action manipulation keeps taps working while letting swipes scroll the sheet. */
+.quad.tap { --s: 148px; cursor: crosshair; touch-action: manipulation; }
 .quad.tap:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .quad .dot.mine { background: radial-gradient(circle at 35% 35%, var(--accent-2), var(--accent)); }
 .quad .dot.expert { background: transparent; border: 2.5px solid var(--ink-3);
@@ -456,7 +476,7 @@ textarea.inp { resize: vertical; min-height: 84px; line-height: 1.5; }
   border: 1px solid var(--line-soft); border-radius: var(--r-md); cursor: pointer; margin-bottom: 10px;
   transition: border-color .2s;
 }
-.list-row:active { border-color: var(--accent); }
+.list-row:active, .list-row:hover { border-color: var(--accent); }
 .list-row .lr-main { flex: 1; min-width: 0; }
 .list-row .lr-main .t { font-family: var(--font-display); font-size: 1.2rem; }
 .list-row .lr-main .s { font-size: .82rem; color: var(--ink-3); }

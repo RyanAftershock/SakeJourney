@@ -4,6 +4,7 @@
 
 import { initStore, session, Events } from './store.js';
 import * as Net from './net.js';
+import { closeSheet } from './ui.js';
 import * as Guest from './views/guest.js';
 import * as Host from './views/host.js';
 
@@ -12,6 +13,10 @@ const app = () => document.getElementById('app');
 /* ---------- Theme ---------- */
 export function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme || 'default');
+  // Keep the browser chrome in step with the theme (else Evening mode gets an ivory status bar).
+  const meta = document.querySelector('meta[name="theme-color"]');
+  const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+  if (meta && bg) meta.setAttribute('content', bg);
 }
 
 /* ---------- Routing ---------- */
@@ -39,9 +44,16 @@ const ROUTES = [
 ];
 
 let _nav = 0;
+let _navInTimer = 0;
 async function route() {
   const nav = ++_nav;                    // stamp this navigation
   Net.closeStream();                     // drop any live subscription from the previous screen
+  closeSheet();                          // a sheet belongs to the screen that opened it — never carry
+                                         // one across navigation (it would also leave scroll locked)
+  // Entrance animation is navigation-only: live re-renders outside route() don't get .nav-in.
+  app().classList.add('nav-in');
+  clearTimeout(_navInTimer);
+  _navInTimer = setTimeout(() => app().classList.remove('nav-in'), 600);
   const hash = location.hash || '#/';
   for (const [re, handler] of ROUTES) {
     const m = hash.match(re);

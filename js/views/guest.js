@@ -13,10 +13,9 @@ import {
   heartsHTML, wireHearts, miniHearts, toast, openSheet, closeSheet, pickPhoto,
   fmtDate, ordinal,
 } from '../ui.js';
-import { applyTheme } from '../app.js';
+import { applyTheme, go } from '../app.js';
 
 const app = () => document.getElementById('app');
-const go = (h) => { location.hash = h; };
 
 /* ---------- shared data helpers ---------- */
 async function activeEvent() {
@@ -154,7 +153,7 @@ export async function home() {
   }));
 
   app().innerHTML = `
-    <div class="screen pad-bottom-bar">
+    <div class="screen pad-bottom-bar-2">
       <div class="topbar">
         <a class="brand" href="#/"><span class="brand-logo" role="img" aria-label="Sake Journey"></span></a>
         <button class="iconbtn" id="toHost" aria-label="Host tools">${svg('users')}</button>
@@ -413,7 +412,7 @@ export async function finaleStep(i) {
     `<span class="dot ${idx + 1 < i ? 'done' : ''} ${idx + 1 === i ? 'now' : ''}"></span>`).join('');
 
   app().innerHTML = `
-    <div class="screen pad-bottom-bar">
+    <div class="screen pad-bottom-bar-2">
       <div class="topbar"><button class="iconbtn" id="fback" aria-label="Back">${svg('back')}</button><div class="rail">${rail}</div><span style="width:42px"></span></div>
 
       <div class="center mt-8">
@@ -548,9 +547,10 @@ export async function recap() {
       <button class="linkbtn" id="toHistory" style="display:block;margin:18px auto 0">See your full tasting history →</button>
     </div>
 
-    <div class="actionbar">
+    <div class="actionbar col gap-4">
       ${guest.identified
-        ? `<button class="btn primary block" id="done">We’ll send this to ${esc(guest.email || 'your inbox')}</button>`
+        ? `<button class="btn primary block" id="done">Your recap is coming ✨</button>
+           <div class="faint center" style="font-size:.75rem;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">to ${esc(guest.email || 'your inbox')}</div>`
         : `<button class="btn primary block" id="capture">${svg('sparkle')} Email me my night</button>`}
     </div>`;
 
@@ -827,7 +827,7 @@ export async function history() {
       <button class="btn subtle block mt-16" id="logSake">${svg('plus')} Log a sake you’re tasting</button>
       <div class="mt-16">${rows}</div>
       ${loggedIn
-        ? `<p class="faint center mt-24" style="font-size:.8rem">Signed in as ${esc(email)} · <button class="linkbtn" id="logout" style="padding:0;font-size:.8rem">Sign out</button></p>`
+        ? `<p class="faint center mt-24" style="font-size:.8rem">Signed in as ${esc(email)} · <button class="linkbtn" id="logout" style="padding:10px 8px;font-size:.8rem">Sign out</button></p>`
         : `<p class="faint center mt-24" style="font-size:.8rem;line-height:1.5">Saved on this device.<br><button class="linkbtn" id="toLogin" style="padding:6px 0 0">Sign in to see your journey on any device →</button></p>`}
     </div>`;
 
@@ -900,16 +900,14 @@ export async function login() {
           <input class="inp" id="loginEmail" type="email" placeholder="you@example.com" style="text-align:center" value="${esc(Net.guestEmail())}" autocomplete="email">
           <button class="btn primary block mt-16" id="loginSend">Email me a link</button>
           <div id="loginMsg" class="faint mt-16" style="font-size:.85rem;line-height:1.5"></div>
-          <div id="pwWrap" class="hidden mt-16">
-            <input class="inp" id="pwField" type="password" placeholder="Festival password" autocomplete="current-password" style="text-align:center">
-            <button class="btn primary block mt-8" id="pwSend">Sign in with password</button>
-          </div>
-          <button class="linkbtn" id="toPassword" style="display:block;margin:14px auto 0;font-size:.82rem">Have a festival password? Sign in with it →</button>
+          <div class="divider" style="margin:22px 0 14px"><span class="k" style="font-family:var(--font-ui);font-size:.66rem;letter-spacing:.18em">FESTIVAL TRIAL</span></div>
+          <p class="faint" style="font-size:.82rem;margin-bottom:10px">Trying Sake Journey at a festival? Use your email above with your festival password.</p>
+          <input class="inp" id="pwField" type="password" placeholder="Festival password" autocomplete="current-password" style="text-align:center">
+          <button class="btn subtle block mt-8" id="pwSend">Sign in with password</button>
         </div>
       </div>
     </div>`;
   $('#back').onclick = () => go('#/history');
-  $('#toPassword').onclick = () => { $('#pwWrap').classList.remove('hidden'); $('#pwField').focus(); };
   const pwSubmit = async () => {
     const email = $('#loginEmail').value.trim();
     if (!email.includes('@')) { toast('Enter your email first'); $('#loginEmail').focus(); return; }
@@ -1098,10 +1096,13 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     await Ratings.save(guest.id, ev.id, s.id, patch);
     closeSheet();
     toast(`Added “${s.name}” ✨`);
-    maybeAskIdentity(guest);
-    if (solo) history();
+    // Navigate via the router (it owns the hash — rendering home() directly from #/course/N would
+    // leave that course row and "Continue tasting" dead, since re-tapping the same hash is a no-op).
+    if (solo) go('#/history');
     else if ((location.hash || '').startsWith('#/recap') || location.hash.startsWith('#/finale')) go('#/recap');
-    else home();
+    else go('#/');
+    // Ask for identity after the new screen settles — navigation closes any open sheet.
+    setTimeout(() => maybeAskIdentity(guest), 700);
   };
 }
 

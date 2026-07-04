@@ -59,10 +59,11 @@ const GRADE = {
 export const gradeLabel = (g) => GRADE[g] || g || 'Sake';
 
 /* ---------- Four-type quadrant ---------- */
-export function quadrantHTML(type4) {
+export function quadrantHTML(type4, size = 0) {
   const t = TYPE4[type4] || TYPE4.junshu;
+  const mini = size > 0 && size < 90;   // too small for axis labels to be legible
   return `
-    <div class="quad" role="img" aria-label="Flavour type: ${t.name}, ${t.tag}">
+    <div class="quad${mini ? ' mini' : ''}" role="img" aria-label="Flavour type: ${t.name}, ${t.tag}"${size ? ` style="--s:${+size}px"` : ''}>
       <div class="axis v"></div><div class="axis h"></div>
       <span class="lbl t">Aromatic</span><span class="lbl b">Quiet</span>
       <span class="lbl l">Light</span><span class="lbl r">Rich</span>
