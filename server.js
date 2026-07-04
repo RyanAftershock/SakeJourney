@@ -67,6 +67,49 @@ const MENU_PROMPT = `You are reading a photograph of a printed menu for a sake p
 - courses: in the order printed. For each: the dish "name"; a short "desc" (garnishes, sauce, or sub-line as printed, else ""); the "sakeName" exactly as printed (include brewery/region if shown); a best-guess "sakeGrade" from the allowed list ONLY if the menu states or clearly implies it (e.g. the words "Junmai Ginjo"), else ""; and "pairingText" = any pairing rationale actually printed on the menu, else "".
 Do NOT fabricate taste profiles, SMV, or pairing reasons that are not printed. Use empty strings for anything absent. Record the result via the record_menu tool.`;
 
+// Sake label scan: read a bottle photo, research the sake publicly, and place it on the four-type map.
+const TYPE4_ENUM = ['', 'kunshu', 'soshu', 'junshu', 'jukushu'];
+const SAKE_SCAN_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    identified: { type: 'boolean' },
+    confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
+    name: { type: 'string' },          // romanized display name
+    japaneseName: { type: 'string' },  // kanji / kana as on the label
+    brewery: { type: 'string' },
+    region: { type: 'string' },
+    grade: { type: 'string', enum: GRADE_ENUM },
+    type4: { type: 'string', enum: TYPE4_ENUM },
+    expertX: { type: 'number' },        // 0 light → 100 rich
+    expertY: { type: 'number' },        // 0 aromatic → 100 quiet
+    smv: { type: 'string' }, acidity: { type: 'string' }, abv: { type: 'string' }, seimai: { type: 'string' },
+    profile: { type: 'string' },        // one evocative tasting line
+    tags: { type: 'array', items: { type: 'string' } },
+    about: { type: 'string' },          // 2-4 plain sentences of researched public info
+    sources: { type: 'array', items: { type: 'string' } }, // short labels of where info came from
+  },
+  required: ['identified', 'confidence', 'name', 'japaneseName', 'brewery', 'region', 'grade', 'type4',
+    'expertX', 'expertY', 'smv', 'acidity', 'abv', 'seimai', 'profile', 'tags', 'about', 'sources'],
+};
+const SAKE_SCAN_PROMPT = `You are identifying a specific bottle of sake from a photo of its label, for a personal tasting journal.
+Work in steps:
+1. Read EVERYTHING legible on the label — the romanized and Japanese name, the brewery (kura), the region/prefecture, the classification (e.g. Junmai Daiginjo), and any printed numbers (seimaibuai/polishing ratio, nihonshu-do/SMV, acidity, alcohol %).
+2. Use web_search to find reputable public information about THIS sake and its brewery — official brewery pages, importers/retailers, sake databases, and reviews. Search a few times if the first results are thin.
+3. Then finish by calling record_sake with your best synthesis.
+
+Rules:
+- Only state specs you can actually read on the label or find from a reputable source. NEVER invent numbers, awards, or notes.
+- expert flavour placement uses the Sake Service Institute four-type map:
+  · X axis 0–100: 0 = light, delicate, clean; 100 = rich, full, savoury/umami.
+  · Y axis 0–100: 0 = highly aromatic/fragrant; 100 = quiet, subdued aroma.
+  · type4 quadrant: kunshu = aromatic & light (x<50, y<50); soshu = quiet & light (x<50, y>50); junshu = quiet & rich (x>50, y>50); jukushu = aromatic & rich (x>50, y<50).
+  Put expertX/expertY at the point that best represents this sake's known style and set type4 to the matching quadrant.
+- about: 2–4 plain sentences (no markup) of the most useful public info — brewery/region, style, signature notes, food pairings, awards.
+- sources: up to 4 short labels for where the info came from (e.g. "brewery site", "a domain name"). Do not include full URLs.
+- profile: one evocative sentence for how it tastes. tags: 3–6 short flavour/style words.
+- If you truly cannot identify the sake, set identified=false, fill whatever the label shows, and leave unknowns as "" / [] / 50.
+Always finish by calling the record_sake tool.`;
+
 /* ---------- Persistence ---------- */
 let db = { events: {}, sakes: {}, guests: {}, ratings: {}, magicTokens: {}, guestTokens: {} };
 
@@ -191,9 +234,9 @@ function sanitizePhotos(r) {
 
 // Only known fields are ever written — an attacker can't smuggle arbitrary properties into a record.
 const pick = (obj, keys) => { const o = {}; for (const k of keys) if (k in obj) o[k] = obj[k]; return o; };
-const RATING_FIELDS = ['id', 'guestId', 'eventId', 'sakeId', 'guestEvent', 's1', 's2', 'wouldBuy', 'photoBottle', 'photoFood', 'photo', 'note', 'logged', 'createdAt', 'updatedAt'];
+const RATING_FIELDS = ['id', 'guestId', 'eventId', 'sakeId', 'guestEvent', 's1', 's2', 'wouldBuy', 'photoBottle', 'photoFood', 'photo', 'note', 'myX', 'myY', 'logged', 'createdAt', 'updatedAt'];
 const GUEST_FIELDS = ['id', 'name', 'email', 'consentMarketing', 'consentPhotoFood', 'consentPhotoMe', 'consentAt', 'eventIds', 'createdAt', 'identified'];
-const SAKE_FIELDS = ['id', 'name', 'romaji', 'brewery', 'region', 'grade', 'type4', 'temp', 'smv', 'acidity', 'amino', 'abv', 'seimai', 'profile', 'tags', 'adhoc', 'eventId', 'addedBy', '_deleted'];
+const SAKE_FIELDS = ['id', 'name', 'romaji', 'brewery', 'region', 'grade', 'type4', 'temp', 'smv', 'acidity', 'amino', 'abv', 'seimai', 'profile', 'tags', 'about', 'expertX', 'expertY', 'adhoc', 'eventId', 'addedBy', '_deleted'];
 // Generous ceilings that never bite a real event but cap runaway abuse of the open write endpoints.
 const MAX_RATINGS_PER_EVENT = 6000, MAX_GUESTS_PER_EVENT = 1500, MAX_SAKES = 6000;
 const countBy = (coll, pred) => Object.values(coll).reduce((n, x) => n + (pred(x) ? 1 : 0), 0);
@@ -255,6 +298,68 @@ async function parseMenuImage(mediaType, b64) {
   const tool = (data.content || []).find((b) => b.type === 'tool_use');
   if (!tool) throw new Error('no structured result returned');
   return tool.input;
+}
+
+/* ---------- Sake label scan: vision + (optional) live web research → structured record ---------- */
+// Coerce/clamp the model's output so a strange result can never bloat storage or inject into a style attr.
+function sanitizeScan(o = {}) {
+  const clamp = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : d; };
+  const str = (v, max) => (typeof v === 'string' ? v : '').slice(0, max);
+  const list = (v, n, max) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).slice(0, n).map((x) => x.slice(0, max)) : []);
+  return {
+    identified: !!o.identified,
+    confidence: ['low', 'medium', 'high'].includes(o.confidence) ? o.confidence : 'low',
+    name: str(o.name, 120), japaneseName: str(o.japaneseName, 120),
+    brewery: str(o.brewery, 120), region: str(o.region, 80),
+    grade: GRADE_ENUM.includes(o.grade) ? o.grade : '',
+    type4: TYPE4_ENUM.includes(o.type4) ? o.type4 : '',
+    expertX: clamp(o.expertX, 50), expertY: clamp(o.expertY, 50),
+    smv: str(o.smv, 16), acidity: str(o.acidity, 16), abv: str(o.abv, 16), seimai: str(o.seimai, 16),
+    profile: str(o.profile, 300), tags: list(o.tags, 8, 40),
+    about: str(o.about, 900), sources: list(o.sources, 5, 80),
+  };
+}
+
+// Identify a sake from its label. With useSearch the model may web_search first (tool_choice auto, so we
+// loop to handle pause_turn / a stray text turn); without it we force the record_sake tool for a one-shot
+// answer from vision + the model's own knowledge — the graceful fallback if web search is unavailable.
+async function identifySakeImage(mediaType, b64, useSearch) {
+  const tools = [];
+  // Basic (direct) web search — simplest server-tool shape, no code-execution routing; plenty for a
+  // single-bottle lookup. max_uses caps cost/latency. record_sake is the client tool we read back.
+  if (useSearch) tools.push({ type: 'web_search_20250305', name: 'web_search', max_uses: 5 });
+  tools.push({ name: 'record_sake', description: 'Record the identified sake and its researched details.', input_schema: SAKE_SCAN_SCHEMA, strict: true });
+  const messages = [{
+    role: 'user',
+    content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } },
+      { type: 'text', text: SAKE_SCAN_PROMPT },
+    ],
+  }];
+  for (let round = 0; round < 5; round++) {
+    const body = { model: MENU_MODEL, max_tokens: 4096, tools, messages };
+    if (!useSearch) body.tool_choice = { type: 'tool', name: 'record_sake' };
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`Anthropic ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    const data = await r.json();
+    const rec = (data.content || []).find((bl) => bl.type === 'tool_use' && bl.name === 'record_sake');
+    if (rec) return rec.input;
+    if (!useSearch) throw new Error('no structured result returned');
+    // Server tool still running (long research) → resume with the accumulated turn.
+    if (data.stop_reason === 'pause_turn') { messages.push({ role: 'assistant', content: data.content }); continue; }
+    // Model answered in prose without recording → nudge it once to call the tool.
+    if (round < 4) {
+      messages.push({ role: 'assistant', content: data.content });
+      messages.push({ role: 'user', content: [{ type: 'text', text: 'Now call the record_sake tool with your best synthesis.' }] });
+      continue;
+    }
+    throw new Error('no structured result returned');
+  }
+  throw new Error('scan did not converge');
 }
 
 /* ---------- Venue lookup: read a restaurant's site for photo + menu/booking links ---------- */
@@ -471,6 +576,26 @@ async function handleAPI(req, res, url) {
     if (!m) return sendJSON(res, 400, { error: 'bad_image' });
     try { return sendJSON(res, 200, await parseMenuImage(m[1], m[2])); }
     catch (e) { console.error('parse-menu failed:', e.message); return sendJSON(res, 502, { error: 'parse_failed', message: String(e.message || e) }); }
+  }
+
+  // Scan a sake bottle label → identify it, research it publicly, and place it on the four-type map.
+  // Guest-only (a valid session token) and rate-limited, since each scan is a billed AI + web-search call.
+  if (req.method === 'POST' && p === '/api/scan-sake') {
+    const email = guestEmailFromReq(req);
+    if (!email) return sendJSON(res, 401, { error: 'unauthorized' });
+    if (!ANTHROPIC_API_KEY) return sendJSON(res, 400, { error: 'no_api_key', message: 'Sake scanning is not enabled on this server.' });
+    if (!rateLimit('scan:' + email, 40, 60 * 60 * 1000) || !rateLimit('scanip:' + clientIp(req), 80, 60 * 60 * 1000))
+      return sendJSON(res, 429, { error: 'too_many_requests', message: 'That’s a lot of scans — give it a minute.' });
+    const b = await readBody(req);
+    const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(b.image || '');
+    if (!m) return sendJSON(res, 400, { error: 'bad_image' });
+    try {
+      let out;
+      // Prefer live web research; if that path errors (e.g. web search unavailable), still identify from the photo.
+      try { out = await identifySakeImage(m[1], m[2], true); }
+      catch (e) { console.error('scan-sake (with search) failed, retrying without:', e.message); out = await identifySakeImage(m[1], m[2], false); }
+      return sendJSON(res, 200, sanitizeScan(out));
+    } catch (e) { console.error('scan-sake failed:', e.message); return sendJSON(res, 502, { error: 'scan_failed', message: String(e.message || e) }); }
   }
 
   // Look up a restaurant's site → photo + menu/booking links (host-only, no external key).

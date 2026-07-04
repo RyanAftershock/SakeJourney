@@ -798,6 +798,7 @@ export async function history() {
           </div>
         </div>
         ${it.sake.profile ? `<p class="profile-line" style="font-size:1rem;margin-top:10px">“${esc(it.sake.profile)}”</p>` : ''}
+        ${pourTasteHTML(it.sake, r)}
         ${it.course && it.course.pairing && it.course.pairing.text
           ? `<div class="faint" style="font-size:.82rem;margin-top:8px">${esc(it.event.host)}: “${esc(it.course.pairing.text)}”</div>` : ''}
         ${r.note ? `<div class="why" style="padding:12px;margin-top:10px"><div class="eyebrow" style="color:var(--ink-3);margin-bottom:4px">Your note</div><p style="font-size:1rem">${esc(r.note)}</p></div>` : ''}
@@ -974,13 +975,16 @@ export async function claim(token) {
 async function openAddSake(ev, guest, { solo = false } = {}) {
   const heading = solo ? 'Log a sake' : 'A surprise pour';
   const intro = solo
-    ? 'Tasting a sake anywhere — a bar, a bottle at home? Capture it and keep it in your journey.'
+    ? 'Tasting a sake anywhere — a bar, a bottle at home? Snap the label and we’ll try to identify it and research it for you.'
     : `${esc(ev.host || 'Your host')} poured something off-menu? Capture it and add it to your night.`;
   const namePh = solo ? 'e.g. Dassai 45, or ‘the one at the izakaya’' : 'e.g. Dassai 45, or ‘the cloudy one’';
+  const canScan = solo && !!Net.guestToken();   // scanning is a signed-in, server-side feature
   const body = openSheet(`
     <h2 class="serif" style="font-size:1.6rem">${heading}</h2>
     <p class="muted" style="font-size:.92rem;margin:4px 0 16px">${intro}</p>
-    <div class="photo-zone" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the bottle</span></div></div>
+    <div class="photo-zone" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the label</span></div></div>
+    ${canScan ? `<button class="btn subtle block mt-8 hidden" id="spScan">${svg('sparkle')} Identify this sake with AI</button>` : ''}
+    <div id="spFound"></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
       <input class="inp" id="spName" placeholder="${namePh}"></label>
     <div class="rate-block center card" style="background:var(--surface)">
@@ -988,34 +992,109 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       <div class="hearts-wrap">${heartsHTML(0)}</div>
       <div class="rate-word"></div>
     </div>
+    ${solo ? `<div id="spMatrix"></div>` : ''}
     <button class="btn primary block mt-16" id="spSave">${solo ? 'Save to my journey' : 'Add to my night'}</button>
     <button class="linkbtn" id="spCancel" style="display:block;margin:8px auto 0">Cancel</button>
   `, { label: heading });
 
-  let photo = null, score = 0;
-  const spZone = body.querySelector('#spPhoto');
+  let photo = null, score = 0, scanned = null, myX = null, myY = null;
+  const q = (sel) => body.querySelector(sel);
+
+  // ---- interactive self-vs-expert taste matrix (solo only) ----
+  const mineTag = (x, y) => TYPE4[x < 50 ? (y < 50 ? 'kunshu' : 'soshu') : (y < 50 ? 'jukushu' : 'junshu')].tag;
+  function renderMatrix() {
+    const wrap = q('#spMatrix'); if (!wrap) return;
+    const ex = scanned && Number.isFinite(+scanned.expertX) ? clampPct(scanned.expertX) : null;
+    const ey = scanned && Number.isFinite(+scanned.expertY) ? clampPct(scanned.expertY) : null;
+    const hasExpert = ex !== null && ey !== null && (scanned.type4 || scanned.identified);
+    const expertName = hasExpert && scanned.type4 && TYPE4[scanned.type4] ? TYPE4[scanned.type4].name : '';
+    wrap.innerHTML = `
+      <div class="card mt-16">
+        <div class="eyebrow" style="color:var(--ink-3)">Your tasting profile</div>
+        <p class="faint" style="font-size:.8rem;margin:4px 0 12px">Tap the map where it sits for <b>you</b> — light ↔ rich, aromatic ↔ quiet.${hasExpert ? ' The hollow dot is the expert read.' : ''}</p>
+        <div class="row gap-16" style="align-items:center">
+          <div class="quad tap" id="spQuad" role="application" tabindex="0" aria-label="Tap or use arrow keys to place your taste dot">
+            <div class="axis v"></div><div class="axis h"></div>
+            <span class="lbl t">Aromatic</span><span class="lbl b">Quiet</span>
+            <span class="lbl l">Light</span><span class="lbl r">Rich</span>
+            ${hasExpert ? `<span class="dot expert" style="left:${ex}%;top:${ey}%"></span>` : ''}
+            <span class="dot mine ${myX === null ? 'hidden' : ''}" id="spMineDot" style="${myX === null ? '' : `left:${myX}%;top:${myY}%`}"></span>
+          </div>
+          <div style="flex:1;min-width:0">
+            <div class="matrix-legend"><span class="key"><span class="dot mine sm"></span>You</span>${hasExpert ? `<span class="key"><span class="dot expert sm"></span>Expert${expertName ? ' · ' + esc(expertName) : ''}</span>` : ''}</div>
+            <div class="faint" id="spMineLabel" style="font-size:.82rem;margin-top:8px">${myX === null ? 'Tap the map to add yours.' : 'You: ' + esc(mineTag(myX, myY))}</div>
+          </div>
+        </div>
+      </div>`;
+    const quad = q('#spQuad');
+    const setMine = (x, y) => {
+      myX = clampPct(x); myY = clampPct(y);
+      const dot = q('#spMineDot'); if (dot) { dot.style.left = myX + '%'; dot.style.top = myY + '%'; dot.classList.remove('hidden'); }
+      const lab = q('#spMineLabel'); if (lab) lab.textContent = 'You: ' + mineTag(myX, myY);
+    };
+    quad.onclick = (e) => { const r = quad.getBoundingClientRect(); setMine(((e.clientX - r.left) / r.width) * 100, ((e.clientY - r.top) / r.height) * 100); };
+    quad.onkeydown = (e) => {
+      const step = e.shiftKey ? 10 : 4; let nx = myX === null ? 50 : myX, ny = myY === null ? 50 : myY, used = true;
+      if (e.key === 'ArrowLeft') nx -= step; else if (e.key === 'ArrowRight') nx += step;
+      else if (e.key === 'ArrowUp') ny -= step; else if (e.key === 'ArrowDown') ny += step; else used = false;
+      if (used) { e.preventDefault(); setMine(nx, ny); }
+    };
+  }
+  if (solo) renderMatrix();
+
+  // ---- photo capture ----
+  const spZone = q('#spPhoto');
   spZone.onclick = async () => {
     const d = await pickPhoto(); if (!d) return; photo = d;
     spZone.innerHTML = `<img src="${esc(d)}" alt="">`;
+    const scanBtn = q('#spScan'); if (scanBtn) scanBtn.classList.remove('hidden');
   };
   spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
-  wireHearts(body.querySelector('.hearts-wrap'), 0, (v) => (score = v));
-  body.querySelector('#spCancel').onclick = () => closeSheet();
-  body.querySelector('#spSave').onclick = async () => {
-    const name = body.querySelector('#spName').value.trim();
+
+  // ---- AI scan ----
+  const scanBtn = q('#spScan');
+  if (scanBtn) scanBtn.onclick = async () => {
+    if (!photo) { toast('Snap the label first'); return; }
+    scanBtn.disabled = true; scanBtn.innerHTML = 'Reading the label…';
+    try {
+      scanned = await Net.scanSake(photo);
+      const nameEl = q('#spName');
+      if (scanned.name && !nameEl.value.trim()) nameEl.value = scanned.name;
+      q('#spFound').innerHTML = scanAboutHTML(scanned);
+      renderMatrix();
+      toast(scanned.identified ? 'Identified ✨' : 'Logged what we could read');
+    } catch (e) { toast(e.message || 'Couldn’t read that one'); }
+    finally { scanBtn.disabled = false; scanBtn.innerHTML = `${svg('sparkle')} ${scanned ? 'Scan again' : 'Identify this sake with AI'}`; }
+  };
+
+  wireHearts(q('.hearts-wrap'), 0, (v) => (score = v));
+  q('#spCancel').onclick = () => closeSheet();
+  q('#spSave').onclick = async () => {
+    const name = q('#spName').value.trim();
     if (!name && !photo) { toast('Add a name or a photo'); return; }
     // A solo pour attaches to this device's guest and the personal journal — make sure both exist.
     if (solo) guest = await Guests.ensure(SOLO_EVENT.id);
+    const sc = scanned || {};
     const s = {
-      id: uid('s'), name: name || (solo ? 'A sake' : 'Surprise pour'), romaji: '', brewery: solo ? '' : 'Off-menu', region: '',
-      grade: '', type4: 'junshu', temp: 'joon', smv: '', acidity: '', abv: '', seimai: '',
-      profile: solo ? 'A sake you logged on your own.' : 'A spontaneous pour, added at the table.',
-      tags: solo ? ['solo'] : ['surprise'],
+      id: uid('s'),
+      name: name || sc.name || (solo ? 'A sake' : 'Surprise pour'),
+      romaji: sc.japaneseName || '',
+      brewery: sc.brewery || (solo ? '' : 'Off-menu'),
+      region: sc.region || '',
+      grade: sc.grade || '',
+      type4: sc.type4 || 'junshu',
+      temp: 'joon',
+      smv: sc.smv || '', acidity: sc.acidity || '', abv: sc.abv || '', seimai: sc.seimai || '',
+      profile: sc.profile || (solo ? 'A sake you logged on your own.' : 'A spontaneous pour, added at the table.'),
+      tags: (sc.tags && sc.tags.length) ? sc.tags : (solo ? ['solo'] : ['surprise']),
+      about: sc.about || '',
       adhoc: true, eventId: ev.id, addedBy: guest.id,
     };
+    if (scanned && Number.isFinite(+sc.expertX) && (sc.type4 || sc.identified)) { s.expertX = clampPct(sc.expertX); s.expertY = clampPct(sc.expertY); }
     await Sakes.save(s);
     const patch = { s1: score || null, photoBottle: photo };
     if (solo) patch.logged = true;   // a named solo entry counts even without a score
+    if (myX !== null && myY !== null) { patch.myX = myX; patch.myY = myY; }
     await Ratings.save(guest.id, ev.id, s.id, patch);
     closeSheet();
     toast(`Added “${s.name}” ✨`);
@@ -1024,6 +1103,57 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     else if ((location.hash || '').startsWith('#/recap') || location.hash.startsWith('#/finale')) go('#/recap');
     else home();
   };
+}
+
+const clampPct = (v) => Math.max(0, Math.min(100, Math.round(+v) || 0));
+
+/** The "what we found" research card shown after an AI scan. Everything is escaped — model text is untrusted. */
+function scanAboutHTML(sc) {
+  if (!sc) return '';
+  const specs = [];
+  if (sc.grade) specs.push(gradeLabel(sc.grade));
+  if (sc.seimai) specs.push('Seimai ' + esc(String(sc.seimai)));
+  if (sc.smv) specs.push('SMV ' + esc(String(sc.smv)));
+  if (sc.abv) specs.push(esc(String(sc.abv)) + (String(sc.abv).includes('%') ? '' : '% ABV'));
+  const chips = (sc.tags || []).slice(0, 6).map((t) => `<span class="mini-tag">${esc(t)}</span>`).join('');
+  const src = (sc.sources || []).length ? `<div class="faint" style="font-size:.72rem;margin-top:8px">Sources: ${sc.sources.map((x) => esc(x)).join(' · ')}</div>` : '';
+  const header = sc.brewery ? `${esc(sc.brewery)}${sc.region ? ' · ' + esc(sc.region) : ''}` : (sc.region ? esc(sc.region) : '');
+  return `
+    <div class="card mt-8">
+      <div class="eyebrow" style="color:var(--accent)">${svg('sparkle')} What we found${sc.identified ? '' : ' <span class="faint" style="text-transform:none;letter-spacing:0">· best guess</span>'}</div>
+      ${sc.japaneseName ? `<div class="sake-sub" style="font-family:var(--font-jp);margin-top:4px">${esc(sc.japaneseName)}</div>` : ''}
+      ${header ? `<div class="serif" style="font-size:1.05rem">${header}</div>` : ''}
+      ${specs.length ? `<div class="faint" style="font-size:.8rem;margin-top:2px">${specs.join(' · ')}</div>` : ''}
+      ${sc.about ? `<p style="font-size:.9rem;margin:8px 0 0;line-height:1.5">${esc(sc.about)}</p>` : ''}
+      ${chips ? `<div class="mini-tags mt-8">${chips}</div>` : ''}
+      ${src}
+    </div>`;
+}
+
+/** A read-only self-vs-expert quadrant + research, shown on a journey pour that has either dot or research. */
+function pourTasteHTML(sake, r) {
+  const hasMine = r && r.myX != null && Number.isFinite(+r.myX) && r.myY != null && Number.isFinite(+r.myY);
+  const hasExpert = sake && sake.expertX != null && Number.isFinite(+sake.expertX) && sake.expertY != null && Number.isFinite(+sake.expertY);
+  if (!hasMine && !hasExpert && !(sake && sake.about)) return '';
+  const dots = `${hasExpert ? `<span class="dot expert" style="left:${clampPct(sake.expertX)}%;top:${clampPct(sake.expertY)}%"></span>` : ''}${hasMine ? `<span class="dot mine" style="left:${clampPct(r.myX)}%;top:${clampPct(r.myY)}%"></span>` : ''}`;
+  const legend = `${hasMine ? '<span class="key"><span class="dot mine sm"></span>You</span>' : ''}${hasExpert ? `<span class="key"><span class="dot expert sm"></span>Expert${sake.type4 && TYPE4[sake.type4] ? ' · ' + esc(TYPE4[sake.type4].name) : ''}</span>` : ''}`;
+  const quad = (hasMine || hasExpert) ? `
+    <div class="quad" role="img" aria-label="Your taste placement versus the expert">
+      <div class="axis v"></div><div class="axis h"></div>
+      <span class="lbl t">Aromatic</span><span class="lbl b">Quiet</span>
+      <span class="lbl l">Light</span><span class="lbl r">Rich</span>
+      ${dots}
+    </div>` : '';
+  return `
+    <div class="why" style="padding:12px;margin-top:10px">
+      <div class="row gap-12" style="align-items:center">
+        ${quad}
+        <div style="flex:1;min-width:0">
+          ${legend ? `<div class="matrix-legend">${legend}</div>` : ''}
+          ${sake.about ? `<p class="faint" style="font-size:.82rem;line-height:1.5;margin-top:${legend ? '8px' : '0'}">${esc(sake.about)}</p>` : ''}
+        </div>
+      </div>
+    </div>`;
 }
 
 /* ============================================================
