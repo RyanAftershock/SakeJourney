@@ -169,6 +169,13 @@ export async function guestLogin(email) {
   if (!r.ok) throw new Error(data.message || data.error || `HTTP ${r.status}`);
   return data;
 }
+/** Festival trial: sign in with an allow-listed email + shared password → { sessionToken, email, guest }. */
+export async function guestPasswordLogin(email, password) {
+  const r = await fetch(BASE + '/api/guest/password-login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error === 'invalid_login' ? 'Email or password not recognised' : (data.message || data.error || `HTTP ${r.status}`));
+  return data;
+}
 /** Claim a magic-link token → { sessionToken, email, guest }. */
 export async function guestClaim(token) {
   const r = await fetch(BASE + '/api/guest/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
