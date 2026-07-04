@@ -5,7 +5,7 @@
    A backend can later replace the persist() calls 1:1.
    ============================================================ */
 
-import { SEED_EVENT, SEED_SAKES } from './seed.js';
+import { SEED_EVENT, SEED_SAKES, SOLO_EVENT } from './seed.js';
 import * as Net from './net.js';
 
 const DB_NAME = 'sake-journey';
@@ -96,6 +96,8 @@ export async function initStore() {
     await put('events', SEED_EVENT);
     await put('meta', { k: 'seeded', at: Date.now() });
   }
+  // The personal journal must exist locally too (also for already-seeded devices from before this shipped).
+  if (!(await get('events', SOLO_EVENT.id))) await put('events', SOLO_EVENT);
   // Sync with the backend when reachable: pull the shared events + sake library
   // (so every device sees the same menu Kana - Sake Journey authored) and flush offline writes.
   // Bounded by a 3s cap so a stalled (not failed) connection can't hang the first render.

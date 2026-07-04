@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname, resolve } from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { SEED_EVENT, SEED_SAKES } from './js/seed.js';
+import { SEED_EVENT, SEED_SAKES, SOLO_EVENT } from './js/seed.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 5178;
@@ -88,12 +88,14 @@ async function loadDB() {
     db._migratedUnsub = true; dirty = true;
   }
   if (!db.events[SEED_EVENT.id]) { db.events[SEED_EVENT.id] = SEED_EVENT; dirty = true; }
+  if (!db.events[SOLO_EVENT.id]) { db.events[SOLO_EVENT.id] = SOLO_EVENT; dirty = true; }
   if (dirty) save();
 }
 function seed() {
   db = { events: {}, sakes: {}, guests: {}, ratings: {}, magicTokens: {}, guestTokens: {} };
   for (const s of SEED_SAKES) db.sakes[s.id] = s;
   db.events[SEED_EVENT.id] = SEED_EVENT;
+  db.events[SOLO_EVENT.id] = SOLO_EVENT;
 }
 // Debounced, serialised, ATOMIC persistence: write a temp file then rename over db.json
 // (rename is atomic on the same volume), so a crash mid-write can never truncate the live file.
@@ -183,7 +185,7 @@ function sanitizePhotos(r) {
 
 // Only known fields are ever written — an attacker can't smuggle arbitrary properties into a record.
 const pick = (obj, keys) => { const o = {}; for (const k of keys) if (k in obj) o[k] = obj[k]; return o; };
-const RATING_FIELDS = ['id', 'guestId', 'eventId', 'sakeId', 'guestEvent', 's1', 's2', 'wouldBuy', 'photoBottle', 'photoFood', 'photo', 'note', 'createdAt', 'updatedAt'];
+const RATING_FIELDS = ['id', 'guestId', 'eventId', 'sakeId', 'guestEvent', 's1', 's2', 'wouldBuy', 'photoBottle', 'photoFood', 'photo', 'note', 'logged', 'createdAt', 'updatedAt'];
 const GUEST_FIELDS = ['id', 'name', 'email', 'consentMarketing', 'consentPhotoFood', 'consentPhotoMe', 'consentAt', 'eventIds', 'createdAt', 'identified'];
 const SAKE_FIELDS = ['id', 'name', 'romaji', 'brewery', 'region', 'grade', 'type4', 'temp', 'smv', 'acidity', 'amino', 'abv', 'seimai', 'profile', 'tags', 'adhoc', 'eventId', 'addedBy', '_deleted'];
 // Generous ceilings that never bite a real event but cap runaway abuse of the open write endpoints.
@@ -609,7 +611,10 @@ async function handleAPI(req, res, url) {
     const r = pick(await readBody(req), RATING_FIELDS);
     if (!r.id) return sendJSON(res, 400, { error: 'missing id' });
     sanitizePhotos(r);
-    if (!db.ratings[r.id] && countBy(db.ratings, (x) => x.eventId === r.eventId) >= MAX_RATINGS_PER_EVENT)
+    // The per-event cap guards a single hosted event from flooding; the personal journal ('solo') is a
+    // shared bucket across all guests, so the per-event count doesn't apply to it.
+    const evtRec = db.events[r.eventId];
+    if (!db.ratings[r.id] && !(evtRec && evtRec.personal) && countBy(db.ratings, (x) => x.eventId === r.eventId) >= MAX_RATINGS_PER_EVENT)
       return sendJSON(res, 429, { error: 'event_full' });
     db.ratings[r.id] = { ...db.ratings[r.id], ...r }; save();
     broadcast(r.eventId);

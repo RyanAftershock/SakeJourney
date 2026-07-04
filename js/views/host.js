@@ -81,7 +81,7 @@ function wireShell(back) {
 export async function home() {
   if (requireHostAuth()) return;
   applyTheme(session.theme || 'default');
-  const events = await Events.all();
+  const events = (await Events.all()).filter((e) => !e.personal);   // hide the guests' personal journal
   const sakes = await Sakes.all();
   const localGuests = await Guests.all();
 

@@ -75,6 +75,21 @@ export const SEED_SAKES = [
   },
 ];
 
+/* The personal journal — sake a guest logs on their own, outside any hosted event. Seeded on both
+   server and client; hidden from the host's event list and never used as the "tonight" event. */
+export const SOLO_EVENT = {
+  id: 'solo',
+  title: 'Your own tastings',
+  subtitle: 'Sake you’ve logged on your own',
+  theme: 'default',
+  date: '',
+  venue: '',
+  host: 'Kana - Sake Journey',
+  personal: true,
+  published: false,
+  courses: [],
+};
+
 export const SEED_EVENT = {
   id: 'evt-sake-west',
   title: 'Sake & the West',
