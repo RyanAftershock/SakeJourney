@@ -87,7 +87,8 @@ async function returningContext(ev, guest) {
       ratings.push(...await Ratings.forGuestEvent(guest.id, eid));
     }
   }
-  const past = ratings.filter((r) => r.eventId !== ev.id && engaged(r));
+  // Only real hosted nights count as "welcome back" — never the personal journal.
+  const past = ratings.filter((r) => r.eventId !== ev.id && r.eventId !== SOLO_EVENT.id && engaged(r));
   const nights = new Set(past.map((r) => r.eventId));
   if (!nights.size) return null;
 

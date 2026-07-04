@@ -611,7 +611,10 @@ async function handleAPI(req, res, url) {
     const r = pick(await readBody(req), RATING_FIELDS);
     if (!r.id) return sendJSON(res, 400, { error: 'missing id' });
     sanitizePhotos(r);
-    if (!db.ratings[r.id] && countBy(db.ratings, (x) => x.eventId === r.eventId) >= MAX_RATINGS_PER_EVENT)
+    // The per-event cap guards a single hosted event from flooding; the personal journal ('solo') is a
+    // shared bucket across all guests, so the per-event count doesn't apply to it.
+    const evtRec = db.events[r.eventId];
+    if (!db.ratings[r.id] && !(evtRec && evtRec.personal) && countBy(db.ratings, (x) => x.eventId === r.eventId) >= MAX_RATINGS_PER_EVENT)
       return sendJSON(res, 429, { error: 'event_full' });
     db.ratings[r.id] = { ...db.ratings[r.id], ...r }; save();
     broadcast(r.eventId);
