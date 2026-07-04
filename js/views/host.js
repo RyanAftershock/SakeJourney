@@ -15,6 +15,8 @@ import { applyTheme } from '../app.js';
 
 const app = () => document.getElementById('app');
 const go = (h) => { location.hash = h; };
+/** Make a click-wired div row keyboard-activatable (Enter / Space). */
+const keyable = (el) => { if (el) el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); } }; };
 let _resultsRenderedAt = 0;   // throttles the live results re-render (each one re-fetches photos)
 let _recapSending = false;    // guards against a live re-render re-enabling the send button mid-send
 let _galleryAll = false;      // "show all photos" toggle in the results gallery
@@ -92,7 +94,7 @@ export async function home() {
       ? agg.guestCount
       : localGuests.filter((g) => (g.eventIds || []).includes(ev.id)).length;
     return `
-      <div class="list-row" data-ev="${ev.id}">
+      <div class="list-row" data-ev="${ev.id}" role="button" tabindex="0" aria-label="Open ${esc(ev.title)}">
         <div class="lr-main">
           <div class="t">${esc(ev.title)}</div>
           <div class="s">${esc(fmtDate(ev.date))} · ${ev.courses.length} pours · ${count} ${count === 1 ? 'guest' : 'guests'}</div>
@@ -117,7 +119,7 @@ export async function home() {
 
       <div class="divider"><span class="k">蔵</span></div>
 
-      <div class="list-row" id="toLibrary">
+      <div class="list-row" id="toLibrary" role="button" tabindex="0" aria-label="Open the sake library">
         <span class="iconbtn" style="pointer-events:none">${svg('book')}</span>
         <div class="lr-main"><div class="t">Sake library</div>
           <div class="s">${sakes.length} bottles · reused across every event</div></div>
@@ -139,7 +141,8 @@ export async function home() {
   $('#toGuest').onclick = () => go('#/');
   $('#newEv').onclick = createEvent;
   $('#toLibrary').onclick = () => go('#/host/library');
-  $$('.list-row[data-ev]').forEach((r) => r.onclick = () => openEventMenu(r.dataset.ev));
+  keyable($('#toLibrary'));
+  $$('.list-row[data-ev]').forEach((r) => { r.onclick = () => openEventMenu(r.dataset.ev); keyable(r); });
   $$('#themeSeg button').forEach((b) => b.onclick = () => { session.theme = b.dataset.t; applyTheme(b.dataset.t); home(); });
   $('#reset').onclick = async () => { if (confirm('Reset all demo data and guest ratings?')) { await resetAll(); toast('Demo data reset'); home(); } };
   $('#logout').onclick = () => { Net.setHostKey(''); toast('Studio locked'); go('#/'); };
@@ -566,8 +569,8 @@ export async function library() {
   if (requireHostAuth()) return;
   const sakes = await Sakes.all();
   const rows = sakes.map((s) => `
-    <div class="list-row" data-s="${s.id}">
-      <div class="quad" style="--s:52px;flex:none">${quadrantHTML(s.type4)}</div>
+    <div class="list-row" data-s="${s.id}" role="button" tabindex="0" aria-label="Edit ${esc(s.name)}">
+      ${quadrantHTML(s.type4, 52)}
       <div class="lr-main"><div class="t" style="font-size:1.1rem">${esc(s.name)}</div>
         <div class="s">${gradeLabel(s.grade)}${s.region ? ' · ' + esc(s.region) : ''}</div></div>
       <span class="chev">${svg('edit')}</span>
@@ -583,7 +586,7 @@ export async function library() {
   `);
   wireShell('#/host');
   $('#add').onclick = () => editSake(null);
-  $$('.list-row[data-s]').forEach((r) => r.onclick = () => editSake(r.dataset.s));
+  $$('.list-row[data-s]').forEach((r) => { r.onclick = () => editSake(r.dataset.s); keyable(r); });
 }
 
 async function editSake(id) {
