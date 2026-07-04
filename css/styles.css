@@ -315,6 +315,22 @@ h1, h2, h3 { font-family: var(--font-display); font-weight: 500; line-height: 1.
 .quad-legend { font-size: .78rem; color: var(--ink-2); }
 .quad-legend b { color: var(--ink); font-family: var(--font-display); font-size: 1rem; }
 
+/* interactive taste matrix — tap to place your own dot next to the expert read */
+.quad.tap { --s: 148px; cursor: crosshair; touch-action: none; }
+.quad.tap:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.quad .dot.mine { background: radial-gradient(circle at 35% 35%, var(--accent-2), var(--accent)); }
+.quad .dot.expert { background: transparent; border: 2.5px solid var(--ink-3);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ink-3) 12%, transparent); }
+.quad .dot.hidden { display: none; }
+.quad .dot.sm { position: static; display: inline-block; width: 11px; height: 11px;
+  transform: none; box-shadow: none; vertical-align: -1px; margin-right: 5px; flex: none; }
+.quad .dot.expert.sm { box-shadow: none; }
+.matrix-legend { display: flex; flex-wrap: wrap; gap: 12px 14px; font-size: .8rem; color: var(--ink-2); }
+.matrix-legend .key { display: inline-flex; align-items: center; }
+.mini-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.mini-tag { font-size: .72rem; padding: 3px 9px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--line-soft); color: var(--ink-2); }
+
 /* spec chips */
 .specs { display: flex; flex-wrap: wrap; gap: 8px; }
 .spec { text-align: center; min-width: 62px; background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 10px; padding: 8px 10px; }

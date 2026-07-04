@@ -141,6 +141,27 @@ export async function parseMenu(dataUrl) {
   return data;
 }
 
+/** Scan a sake bottle photo (dataURL) → identified sake + researched details + expert flavour placement.
+    Guest-only; the session token rides as a Bearer. Throws with a friendly message on failure. */
+export async function scanSake(dataUrl) {
+  const tok = guestToken();
+  const r = await fetch(BASE + '/api/scan-sake', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) },
+    body: JSON.stringify({ image: dataUrl }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data.error === 'no_api_key' ? 'Scanning isn’t switched on yet — just add the details below.'
+      : data.error === 'unauthorized' ? 'Sign in to identify a bottle by photo.'
+      : data.error === 'too_many_requests' ? (data.message || 'Too many scans — give it a minute.')
+      : data.error === 'bad_image' ? 'That photo didn’t come through — try snapping it again.'
+      : (data.message || data.error || `HTTP ${r.status}`);
+    throw new Error(msg);
+  }
+  return data;
+}
+
 /** Look up a restaurant's website → { name, image, website, menuUrl, reserveUrl }. */
 export async function venueLookup(url) {
   const r = await fetch(BASE + '/api/venue-lookup', {
