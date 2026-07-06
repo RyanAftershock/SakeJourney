@@ -332,6 +332,8 @@ export async function course(n) {
     b.querySelector('span').textContent = on ? 'On your take-home list' : 'I’d take a bottle home';
     if (on) { toast('Added to your take-home list'); maybeAskIdentity(guest); }
   };
+  // The add-a-pour sheet opens from here too — restore it if the camera killed the page.
+  maybeRestoreDraft(ev, guest, 'home');
 }
 
 const spec = (k, v) => `<div class="spec"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`;
@@ -1031,6 +1033,8 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       myX = draft && draft.myX != null ? draft.myX : null, myY = draft && draft.myY != null ? draft.myY : null;
   const q = (sel) => body.querySelector(sel);
   const saveDraft = () => {
+    if (!body.isConnected) return;   // sheet was closed while an await was pending — a deliberate
+                                     // close cleared the draft; never resurrect it from a continuation
     try {
       sessionStorage.setItem(DRAFT_KEY, JSON.stringify({
         at: Date.now(), solo, evId: ev.id, name: q('#spName').value, score, myX, myY, scanned,
@@ -1091,7 +1095,8 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
   };
   spZone.onclick = async () => {
     saveDraft();   // the camera may kill the page — bank what's typed so far first
-    const d = await pickPhoto(); if (!d) return;
+    const d = await pickPhoto();
+    if (!d || !body.isConnected) return;   // cancelled, unreadable, or the sheet was closed meanwhile
     photo = d; showPhoto(); saveDraft();
   };
   spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
@@ -1103,6 +1108,7 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     scanBtn.disabled = true; scanBtn.innerHTML = 'Reading the label…';
     try {
       scanned = await Net.scanSake(photo);
+      if (!body.isConnected) return;   // sheet closed during the scan — don't toast or resurrect a draft
       const nameEl = q('#spName');
       if (scanned.name && !nameEl.value.trim()) nameEl.value = scanned.name;
       q('#spFound').innerHTML = scanAboutHTML(scanned);
