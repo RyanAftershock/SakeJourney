@@ -612,9 +612,27 @@ async function collectJourney(ev, guest, { localOnly = false } = {}) {
     for (const r of (server.ratings || [])) {
       if (!engaged(r)) continue;
       const sake = sakesById[r.sakeId], e = eventsById[r.eventId];
-      if (!sake || !e) continue;
+      if (!sake || sake._deleted || !e) continue;
       const course = (e.courses || []).find((c) => c.sakeId === r.sakeId) || null;
       items.push({ sake, rating: r, event: e, course, final: r.s2 || r.s1 || 0 });
+    }
+    // This device's writes may still be in flight (pushes are fire-and-forget) — overlay any local
+    // rating that's NEWER than the server copy, so a save/edit/delete made seconds ago renders
+    // truthfully instead of racing its own upload. updatedAt is stamped on every Ratings.save.
+    for (const eid of (guest.eventIds || [])) {
+      for (const lr of await Ratings.forGuestEvent(guest.id, eid)) {
+        const idx = items.findIndex((it) => it.rating.id === lr.id);
+        const serverR = (server.ratings || []).find((r) => r.id === lr.id);
+        if (serverR && (serverR.updatedAt || 0) >= (lr.updatedAt || 0)) continue;   // server is current
+        if (idx >= 0) items.splice(idx, 1);
+        if (!engaged(lr)) continue;                                    // just deleted on this device
+        const sake = await Sakes.get(lr.sakeId);
+        if (!sake || sake._deleted) continue;
+        const e = (await Events.get(eid)) || eventsById[eid];
+        if (!e) continue;
+        const course = (e.courses || []).find((c) => c.sakeId === lr.sakeId) || null;
+        items.push({ sake, rating: lr, event: e, course, final: lr.s2 || lr.s1 || 0 });
+      }
     }
   } else {                                         // local: this device's guest
     for (const eid of (guest.eventIds || [])) {
@@ -623,7 +641,7 @@ async function collectJourney(ev, guest, { localOnly = false } = {}) {
       for (const r of await Ratings.forGuestEvent(guest.id, eid)) {
         if (!engaged(r)) continue;
         const sake = await Sakes.get(r.sakeId);
-        if (!sake) continue;
+        if (!sake || sake._deleted) continue;
         const course = (e.courses || []).find((c) => c.sakeId === r.sakeId) || null;
         items.push({ sake, rating: r, event: e, course, final: r.s2 || r.s1 || 0 });
       }
@@ -1008,9 +1026,14 @@ function maybeRestoreDraft(ev, guest, screen) {
   }
 }
 
-/** Rebuild a scan-shaped object from a stored sake, so editing shows its research card + expert dot. */
+/** Rebuild a scan-shaped object from a stored sake, so editing shows its research card + expert dot
+    AND re-saving round-trips every scanned field — a spec-only label read (grade/SMV, no research)
+    must survive a rename edit untouched. */
 function sakeToScan(s) {
-  if (!s || (!s.about && s.expertX == null && !s.brewery && !s.region)) return null;
+  if (!s) return null;
+  const hasContent = s.about || s.expertX != null || s.brewery || s.region
+    || s.grade || s.smv || s.acidity || s.abv || s.seimai || s.romaji;
+  if (!hasContent) return null;
   return {
     identified: true, confidence: 'high',
     name: s.name || '', japaneseName: s.romaji || '', brewery: s.brewery || '', region: s.region || '',
@@ -1147,11 +1170,14 @@ async function openAddSake(ev, guest, { solo = false, edit = null } = {}) {
     try { wake = navigator.wakeLock ? await navigator.wakeLock.request('screen') : null; } catch { /* not granted — proceed */ }
     // Two passes in parallel: a quick vision-only read lands in seconds, the researched one swaps
     // in when it's ready — the guest starts checking the name while the web work continues.
+    let autoFilled = '';   // what WE wrote into the name field, so a corrected researched name can
+                           // replace our own autofill but never the guest's typing
     const applyScan = (result, note) => {
       if (!body.isConnected) return;
       scanned = result;
       const nameEl = q('#spName');
-      if (result.name && !nameEl.value.trim()) nameEl.value = result.name;
+      const cur = nameEl.value.trim();
+      if (result.name && (!cur || cur === autoFilled)) { nameEl.value = result.name; autoFilled = result.name; }
       q('#spFound').innerHTML = scanAboutHTML(result) + (note || '');
       renderMatrix();
       saveDraft();
@@ -1165,23 +1191,27 @@ async function openAddSake(ev, guest, { solo = false, edit = null } = {}) {
       if (res.ok && !fullSettled) applyScan(res.r,
         `<p class="faint center" style="font-size:.78rem;margin-top:8px"><span class="spin"></span> checking the web for more…</p>`);
     });
-    const full = await fullP;
-    fullSettled = true;
-    const quick = await quickP;
     try {
+      // The researched result is never held hostage by a slow quick pass — full settling is the
+      // finish line; quick's outcome only matters for arbitration when full FAILED.
+      const full = await fullP;
+      fullSettled = true;
       if (full.ok) {
         applyScan(full.r);
         if (body.isConnected) toast(full.r.identified ? 'Identified ✨' : 'Logged what we could read');
-      } else if (quick.ok) {
-        // The label read stands; only the web research failed — say so quietly, don't alarm.
-        applyScan(quick.r, `<p class="faint center" style="font-size:.78rem;margin-top:8px">couldn’t reach the web for extra research — these details are from the label</p>`);
-      } else if (body.isConnected) {
-        q('#spFound').innerHTML = `
-          <div class="card mt-8" style="border-color:color-mix(in srgb, var(--danger) 40%, var(--line))">
-            <div class="eyebrow" style="color:var(--danger)">Couldn’t identify it</div>
-            <p class="muted" style="font-size:.88rem;margin-top:4px">${esc(full.e && full.e.message || 'Something went wrong.')}</p>
-            <p class="faint" style="font-size:.8rem;margin-top:6px">Keep the app open while it works, or just fill in the name below — your pour still saves.</p>
-          </div>`;
+      } else {
+        const quick = await quickP;
+        if (quick.ok) {
+          // The label read stands; only the web research failed — say so quietly, don't alarm.
+          applyScan(quick.r, `<p class="faint center" style="font-size:.78rem;margin-top:8px">couldn’t reach the web for extra research — these details are from the label</p>`);
+        } else if (body.isConnected) {
+          q('#spFound').innerHTML = `
+            <div class="card mt-8" style="border-color:color-mix(in srgb, var(--danger) 40%, var(--line))">
+              <div class="eyebrow" style="color:var(--danger)">Couldn’t identify it</div>
+              <p class="muted" style="font-size:.88rem;margin-top:4px">${esc(full.e && full.e.message || 'Something went wrong.')}</p>
+              <p class="faint" style="font-size:.8rem;margin-top:6px">Keep the app open while it works, or just fill in the name below — your pour still saves.</p>
+            </div>`;
+        }
       }
     } finally {
       clearInterval(stageTimer);
@@ -1241,6 +1271,9 @@ async function openAddSake(ev, guest, { solo = false, edit = null } = {}) {
     if (solo) patch.logged = true;   // a named solo entry counts even without a score
     patch.myX = myX; patch.myY = myY;   // null clears a dot the guest removed; numbers persist it
     if (edit) {
+      // Don't re-upload an unchanged photo — the merge keeps it, and a few-hundred-KB PUT is what
+      // let the journey's refresh GET outrun the save on venue wifi.
+      if (photo === photoOf(edit.rating)) delete patch.photoBottle;
       await Ratings.save(edit.rating.guestId, edit.rating.eventId, s.id, patch);
       closeSheet();
       toast('Updated ✓');
