@@ -36,7 +36,10 @@ async function rootRoute() {
     // phone landing from a real table code goes straight into the night, not the front door.
     try { await Events.syncFromServer(); ev = await Events.get(session.activeEventId); } catch { /* offline */ }
   }
-  return Welcome.isCurrentEvent(ev) ? Guest.home() : Welcome.welcome();
+  // A signed-in host previewing an old event bypasses the recency gate — "Preview" from the
+  // studio must always land on the event, even months later.
+  const ok = ev && !ev.personal && (Welcome.isCurrentEvent(ev) || !!Net.hostKey());
+  return ok ? Guest.home() : Welcome.welcome();
 }
 
 const ROUTES = [
