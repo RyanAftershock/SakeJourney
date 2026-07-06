@@ -83,6 +83,10 @@ export const session = {
   // the root route shows the welcome front door instead of defaulting anyone into the seed event.
   get activeEventId() { return LS.get('activeEventId', null); },
   set activeEventId(v) { LS.set('activeEventId', v); },
+  // When the guest EXPLICITLY joined (table QR, in-app scan, sample peek) — an explicit join is
+  // authoritative for the whole evening even if the event's date field is wrong or the demo is old.
+  get joinedEventAt() { return LS.get('joinedEventAt', 0); },
+  set joinedEventAt(v) { LS.set('joinedEventAt', v); },
   get guestId() { return LS.get('guestId', null); },
   set guestId(v) { LS.set('guestId', v); },
   get theme() { return LS.get('theme', null); },

@@ -22,6 +22,15 @@ export function isCurrentEvent(ev) {
   return ev.date >= yesterday;                                 // ISO dates compare lexically
 }
 
+/** Should the root land ON this event? Current by date, or explicitly joined within the last 18h —
+    a table-QR scan is authoritative for the whole evening even when the event's date field is off,
+    and the labelled sample peek keeps working after the seed's printed date passes. */
+export function isLandable(ev) {
+  if (!ev || ev.personal) return false;
+  if (isCurrentEvent(ev)) return true;
+  return ev.id === session.activeEventId && Date.now() - (session.joinedEventAt || 0) < 18 * 3600 * 1000;
+}
+
 export async function welcome() {
   applyTheme(session.theme || 'default');
   const signedIn = !!Net.guestToken();
@@ -29,7 +38,7 @@ export async function welcome() {
   // A stale active event (last week's dinner) still deserves a gentle pointer to the journey,
   // but tonight's event gets a proper "continue" card.
   const active = session.activeEventId ? await Events.get(session.activeEventId) : null;
-  const tonight = isCurrentEvent(active) ? active : null;
+  const tonight = isLandable(active) ? active : null;
 
   app().innerHTML = `
     <div class="screen">
@@ -117,7 +126,7 @@ export async function welcome() {
   if ($('#wScan')) $('#wScan').onclick = scanEventCode;
   $('#wJourney').onclick = () => go('#/history');
   if ($('#wSignIn')) $('#wSignIn').onclick = () => go('#/login');
-  $('#wPeek').onclick = () => { session.activeEventId = SEED_EVENT.id; go('#/'); };
+  $('#wPeek').onclick = () => { session.activeEventId = SEED_EVENT.id; session.joinedEventAt = Date.now(); go('#/'); };
   $('#wHost').onclick = () => go('#/host');
 }
 

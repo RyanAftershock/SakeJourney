@@ -36,16 +36,17 @@ async function rootRoute() {
     // phone landing from a real table code goes straight into the night, not the front door.
     try { await Events.syncFromServer(); ev = await Events.get(session.activeEventId); } catch { /* offline */ }
   }
-  // A signed-in host previewing an old event bypasses the recency gate — "Preview" from the
-  // studio must always land on the event, even months later.
-  const ok = ev && !ev.personal && (Welcome.isCurrentEvent(ev) || !!Net.hostKey());
+  // Landable = current by date OR explicitly joined tonight (QR/scan/peek — see isLandable).
+  // A signed-in host previewing an old event also bypasses the gate — "Preview" from the studio
+  // must always land on the event, even months later.
+  const ok = Welcome.isLandable(ev) || (ev && !ev.personal && !!Net.hostKey());
   return ok ? Guest.home() : Welcome.welcome();
 }
 
 const ROUTES = [
   [/^#?\/?$/,                    () => rootRoute()],
   [/^#\/welcome$/,               () => Welcome.welcome()],
-  [/^#\/e\/([^/]+)$/,            (m) => { session.activeEventId = m[1]; go('#/'); }],
+  [/^#\/e\/([^/]+)$/,            (m) => { session.activeEventId = m[1]; session.joinedEventAt = Date.now(); go('#/'); }],
   [/^#\/course\/(\d+)$/,        (m) => Guest.course(+m[1])],
   [/^#\/finale$/,               () => Guest.finale()],
   [/^#\/finale\/(\d+)$/,        (m) => Guest.finaleStep(+m[1])],
