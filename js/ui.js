@@ -158,35 +158,63 @@ export function closeSheet() {
   document.body.style.overflow = '';
 }
 
-/* ---------- Photo capture (with downscale/compress) ---------- */
+/* ---------- Photo capture (with downscale/compress) ----------
+   Every failure is TOLD to the user — a camera photo that silently vanishes reads as a broken app.
+   Real-world failure modes handled: HEIF/HEIC photos Chrome can't decode (Samsung "high efficiency"
+   mode), the Android camera intent returning a zero-byte file, and slow decodes of huge photos. */
+let _preferChooser = false;   // after a camera photo fails to read, offer the gallery too
 export function pickPhoto() {
   return new Promise((resolve) => {
-    const input = node('<input type="file" accept="image/*" capture="environment" class="hidden">');
+    const input = node(`<input type="file" accept="image/*" ${_preferChooser ? '' : 'capture="environment"'} class="hidden">`);
     document.body.appendChild(input);
+    let settled = false;
+    const finish = (v) => { if (settled) return; settled = true; input.remove(); resolve(v); };
     input.addEventListener('change', async () => {
       const file = input.files && input.files[0];
-      input.remove();
-      if (!file) return resolve(null);
-      try { resolve(await downscale(file)); } catch { resolve(null); }
+      if (!file) return finish(null);
+      if (!file.size) {
+        _preferChooser = true;
+        toast('That photo came through empty — take it again, or pick it from your gallery.', 4500);
+        return finish(null);
+      }
+      // Big camera photos can take a couple of seconds to decode — say so, or it feels frozen.
+      if (file.size > 2_500_000) toast('Reading your photo…', 1600);
+      try { finish(await downscale(file)); }
+      catch {
+        _preferChooser = true;
+        toast('Couldn’t read that photo — some cameras save a format the browser can’t open. Tap again to pick from your gallery, or set your camera to “most compatible” (JPEG).', 6000);
+        finish(null);
+      }
     }, { once: true });
+    input.addEventListener('cancel', () => finish(null), { once: true });
     input.click();
   });
 }
-function downscale(file, max = 1400, quality = 0.82) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const scale = Math.min(1, max / Math.max(img.width, img.height));
-      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-      const c = document.createElement('canvas'); c.width = w; c.height = h;
-      c.getContext('2d').drawImage(img, 0, 0, w, h);
-      resolve(c.toDataURL('image/jpeg', quality));
-    };
-    img.onerror = reject;
-    img.src = url;
-  });
+async function downscale(file, max = 1400, quality = 0.82) {
+  // createImageBitmap decodes more formats (and off the main thread); fall back to <img>.
+  // imageOrientation from-image is explicit so portrait camera shots keep their EXIF rotation —
+  // browsers that reject the option (old Firefox) throw and take the <img> path, which honours EXIF.
+  let src = null, w = 0, h = 0;
+  try { src = await createImageBitmap(file, { imageOrientation: 'from-image' }); w = src.width; h = src.height; } catch { /* try <img> */ }
+  if (!src) {
+    src = await new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+      img.src = url;
+    });
+    w = src.naturalWidth; h = src.naturalHeight;
+  }
+  if (!w || !h) throw new Error('empty image');
+  const scale = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  if (src.close) src.close();
+  const out = c.toDataURL('image/jpeg', quality);
+  if (out.length < 100) throw new Error('encode failed');   // a blank canvas encodes to almost nothing
+  return out;
 }
 
 /* ---------- misc format ---------- */
