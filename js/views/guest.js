@@ -199,6 +199,7 @@ export async function home() {
     const next = ev.courses.findIndex((c) => !progress.find((r) => r.sakeId === c.sakeId && engaged(r)));
     go(`#/course/${next === -1 ? 1 : next + 1}`);
   };
+  maybeRestoreDraft(ev, guest, 'home');
 }
 
 /* ============================================================
@@ -759,6 +760,7 @@ export async function history() {
     $('#back').onclick = () => go('#/');
     if ($('#logSake')) $('#logSake').onclick = () => openAddSake(SOLO_EVENT, guest, { solo: true });
     if ($('#toLogin')) $('#toLogin').onclick = () => go('#/login');
+    maybeRestoreDraft(ev, guest, 'history');
     return;
   }
 
@@ -836,6 +838,7 @@ export async function history() {
   if ($('#toLogin')) $('#toLogin').onclick = () => go('#/login');
   if ($('#logout')) $('#logout').onclick = () => { Net.setGuestSession(null); toast('Signed out'); history(); };
   $$('.note-btn').forEach((b) => (b.onclick = () => editNote(items[+b.dataset.idx].rating)));
+  maybeRestoreDraft(ev, guest, 'history');
 }
 
 async function editNote(rating) {
@@ -970,7 +973,35 @@ export async function claim(token) {
 /* ============================================================
    Surprise pour (+)  —  add & rate an off-menu sake
    ============================================================ */
+/* ---- add-sake draft: survive the page being killed while the camera is open ----
+   Android reclaims background tabs aggressively; coming back from the camera app can mean a full
+   reload that used to throw away everything typed. The draft lives in sessionStorage (survives
+   that reload, dies with the tab) and is cleared whenever the sheet closes on purpose. */
+const DRAFT_KEY = 'sj_sakeDraft';
+function readDraft() {
+  try {
+    const d = JSON.parse(sessionStorage.getItem(DRAFT_KEY));
+    return d && Date.now() - d.at < 45 * 60 * 1000 ? d : null;
+  } catch { return null; }
+}
+const clearDraft = () => { try { sessionStorage.removeItem(DRAFT_KEY); } catch {} };
+
+/** Re-open the add-sake sheet if a draft survived a reload. Call after home()/history() render. */
+function maybeRestoreDraft(ev, guest, screen) {
+  const d = readDraft();
+  if (!d || document.querySelector('.sheet')) return;   // nothing saved, or another dialog is up
+  if (screen === 'history' && d.solo) {
+    toast('Picked up the sake you were logging ✍️');
+    openAddSake(SOLO_EVENT, guest, { solo: true });
+  } else if (screen === 'home' && !d.solo && d.evId === ev.id) {
+    toast('Picked up the pour you were adding ✍️');
+    openAddSake(ev, guest);
+  }
+}
+
 async function openAddSake(ev, guest, { solo = false } = {}) {
+  let draft = readDraft();
+  if (draft && (draft.solo !== solo || (!solo && draft.evId !== ev.id))) draft = null;
   const heading = solo ? 'Log a sake' : 'A surprise pour';
   const intro = solo
     ? 'Tasting a sake anywhere — a bar, a bottle at home? Snap the label and we’ll try to identify it and research it for you.'
@@ -984,19 +1015,29 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     ${canScan ? `<button class="btn subtle block mt-8 hidden" id="spScan">${svg('sparkle')} Identify this sake with AI</button>` : ''}
     <div id="spFound"></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
-      <input class="inp" id="spName" placeholder="${namePh}"></label>
+      <input class="inp" id="spName" placeholder="${namePh}" value="${esc((draft && draft.name) || '')}"></label>
     <div class="rate-block center card" style="background:var(--surface)">
       <div class="rate-label">First impression</div>
-      <div class="hearts-wrap">${heartsHTML(0)}</div>
+      <div class="hearts-wrap">${heartsHTML((draft && draft.score) || 0)}</div>
       <div class="rate-word"></div>
     </div>
     ${solo ? `<div id="spMatrix"></div>` : ''}
     <button class="btn primary block mt-16" id="spSave">${solo ? 'Save to my journey' : 'Add to my night'}</button>
     <button class="linkbtn" id="spCancel" style="display:block;margin:8px auto 0">Cancel</button>
-  `, { label: heading });
+  `, { label: heading, onClose: clearDraft });   // any deliberate close (cancel, Escape, navigation) drops the draft
 
-  let photo = null, score = 0, scanned = null, myX = null, myY = null;
+  let photo = (draft && draft.photo) || null, score = (draft && draft.score) || 0,
+      scanned = (draft && draft.scanned) || null,
+      myX = draft && draft.myX != null ? draft.myX : null, myY = draft && draft.myY != null ? draft.myY : null;
   const q = (sel) => body.querySelector(sel);
+  const saveDraft = () => {
+    try {
+      sessionStorage.setItem(DRAFT_KEY, JSON.stringify({
+        at: Date.now(), solo, evId: ev.id, name: q('#spName').value, score, myX, myY, scanned,
+        photo: photo && photo.length < 1_500_000 ? photo : null,   // stay well inside the quota
+      }));
+    } catch { /* quota — the in-memory state still works */ }
+  };
 
   // ---- interactive self-vs-expert taste matrix (solo only) ----
   const mineTag = (x, y) => TYPE4[x < 50 ? (y < 50 ? 'kunshu' : 'soshu') : (y < 50 ? 'jukushu' : 'junshu')].tag;
@@ -1029,6 +1070,7 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       myX = clampPct(x); myY = clampPct(y);
       const dot = q('#spMineDot'); if (dot) { dot.style.left = myX + '%'; dot.style.top = myY + '%'; dot.classList.remove('hidden'); }
       const lab = q('#spMineLabel'); if (lab) lab.textContent = 'You: ' + mineTag(myX, myY);
+      saveDraft();
     };
     quad.onclick = (e) => { const r = quad.getBoundingClientRect(); setMine(((e.clientX - r.left) / r.width) * 100, ((e.clientY - r.top) / r.height) * 100); };
     quad.onkeydown = (e) => {
@@ -1042,10 +1084,15 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
 
   // ---- photo capture ----
   const spZone = q('#spPhoto');
+  const showPhoto = () => {
+    if (!photo) return;
+    spZone.innerHTML = `<img src="${esc(photo)}" alt="">`;
+    const sb = q('#spScan'); if (sb) sb.classList.remove('hidden');
+  };
   spZone.onclick = async () => {
-    const d = await pickPhoto(); if (!d) return; photo = d;
-    spZone.innerHTML = `<img src="${esc(d)}" alt="">`;
-    const scanBtn = q('#spScan'); if (scanBtn) scanBtn.classList.remove('hidden');
+    saveDraft();   // the camera may kill the page — bank what's typed so far first
+    const d = await pickPhoto(); if (!d) return;
+    photo = d; showPhoto(); saveDraft();
   };
   spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
 
@@ -1060,12 +1107,17 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       if (scanned.name && !nameEl.value.trim()) nameEl.value = scanned.name;
       q('#spFound').innerHTML = scanAboutHTML(scanned);
       renderMatrix();
+      saveDraft();
       toast(scanned.identified ? 'Identified ✨' : 'Logged what we could read');
     } catch (e) { toast(e.message || 'Couldn’t read that one'); }
     finally { scanBtn.disabled = false; scanBtn.innerHTML = `${svg('sparkle')} ${scanned ? 'Scan again' : 'Identify this sake with AI'}`; }
   };
 
-  wireHearts(q('.hearts-wrap'), 0, (v) => (score = v));
+  wireHearts(q('.hearts-wrap'), score, (v) => { score = v; saveDraft(); });
+  q('#spName').addEventListener('input', saveDraft);
+  // restore what a reload interrupted: the photo, the research card (matrix re-rendered above)
+  showPhoto();
+  if (scanned) q('#spFound').innerHTML = scanAboutHTML(scanned);
   q('#spCancel').onclick = () => closeSheet();
   q('#spSave').onclick = async () => {
     const name = q('#spName').value.trim();
