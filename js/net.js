@@ -144,7 +144,7 @@ export async function parseMenu(dataUrl) {
 /** Scan a sake bottle photo (dataURL) → identified sake + researched details + expert flavour placement.
     Guest-only; the session token rides as a Bearer. Throws with a friendly message on failure.
     Aborts after timeoutMs so a dropped mobile connection can't leave the button spinning forever. */
-export async function scanSake(dataUrl, { timeoutMs = 120000 } = {}) {
+export async function scanSake(dataUrl, { mode, timeoutMs = 120000 } = {}) {
   const tok = guestToken();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -153,7 +153,7 @@ export async function scanSake(dataUrl, { timeoutMs = 120000 } = {}) {
     r = await fetch(BASE + '/api/scan-sake', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) },
-      body: JSON.stringify({ image: dataUrl }),
+      body: JSON.stringify({ image: dataUrl, mode: mode || undefined }),
       signal: ctrl.signal,
     });
   } catch (e) {
