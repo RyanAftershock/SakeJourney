@@ -1013,7 +1013,7 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
   const body = openSheet(`
     <h2 class="serif" style="font-size:1.6rem">${heading}</h2>
     <p class="muted" style="font-size:.92rem;margin:4px 0 16px">${intro}</p>
-    <div class="photo-zone" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the label</span></div></div>
+    <div class="photo-zone contain" id="spPhoto" role="button" tabindex="0" aria-label="Take a photo of the bottle" style="aspect-ratio:16/10"><div class="ph">${svg('camera')}<span>Snap the label</span></div></div>
     ${canScan ? `<button class="btn subtle block mt-8 hidden" id="spScan">${svg('sparkle')} Identify this sake with AI</button>` : ''}
     <div id="spFound"></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
@@ -1102,10 +1102,21 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
   spZone.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); spZone.click(); } };
 
   // ---- AI scan ----
+  // The identify call runs 20-60s (vision + live web research). Three things make that wait
+  // survivable on a phone: visible staged progress, a screen wake-lock (Android locks at ~30s idle
+  // and freezes the tab — the request died with it), and errors that PERSIST inline, not a 2s toast.
   const scanBtn = q('#spScan');
   if (scanBtn) scanBtn.onclick = async () => {
     if (!photo) { toast('Snap the label first'); return; }
-    scanBtn.disabled = true; scanBtn.innerHTML = 'Reading the label…';
+    if (scanBtn.disabled) return;
+    scanBtn.disabled = true;
+    const stages = ['Reading the label…', 'Researching this sake…', 'Checking sources…', 'Nearly there…'];
+    let si = 0;
+    const showStage = () => { if (body.isConnected) scanBtn.innerHTML = `<span class="spin"></span> ${stages[si]}`; };
+    showStage();
+    const stageTimer = setInterval(() => { if (si < stages.length - 1) { si++; showStage(); } }, 9000);
+    let wake = null;
+    try { wake = navigator.wakeLock ? await navigator.wakeLock.request('screen') : null; } catch { /* not granted — proceed */ }
     try {
       scanned = await Net.scanSake(photo);
       if (!body.isConnected) return;   // sheet closed during the scan — don't toast or resurrect a draft
@@ -1115,8 +1126,19 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       renderMatrix();
       saveDraft();
       toast(scanned.identified ? 'Identified ✨' : 'Logged what we could read');
-    } catch (e) { toast(e.message || 'Couldn’t read that one'); }
-    finally { scanBtn.disabled = false; scanBtn.innerHTML = `${svg('sparkle')} ${scanned ? 'Scan again' : 'Identify this sake with AI'}`; }
+    } catch (e) {
+      if (!body.isConnected) return;
+      q('#spFound').innerHTML = `
+        <div class="card mt-8" style="border-color:color-mix(in srgb, var(--danger) 40%, var(--line))">
+          <div class="eyebrow" style="color:var(--danger)">Couldn’t identify it</div>
+          <p class="muted" style="font-size:.88rem;margin-top:4px">${esc(e.message || 'Something went wrong.')}</p>
+          <p class="faint" style="font-size:.8rem;margin-top:6px">Keep the app open while it works, or just fill in the name below — your pour still saves.</p>
+        </div>`;
+    } finally {
+      clearInterval(stageTimer);
+      if (wake) { try { wake.release(); } catch { /* already released on tab hide */ } }
+      if (body.isConnected) { scanBtn.disabled = false; scanBtn.innerHTML = `${svg('sparkle')} ${scanned ? 'Scan again' : 'Identify this sake with AI'}`; }
+    }
   };
 
   wireHearts(q('.hearts-wrap'), score, (v) => { score = v; saveDraft(); });

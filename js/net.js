@@ -142,14 +142,25 @@ export async function parseMenu(dataUrl) {
 }
 
 /** Scan a sake bottle photo (dataURL) → identified sake + researched details + expert flavour placement.
-    Guest-only; the session token rides as a Bearer. Throws with a friendly message on failure. */
-export async function scanSake(dataUrl) {
+    Guest-only; the session token rides as a Bearer. Throws with a friendly message on failure.
+    Aborts after timeoutMs so a dropped mobile connection can't leave the button spinning forever. */
+export async function scanSake(dataUrl, { timeoutMs = 120000 } = {}) {
   const tok = guestToken();
-  const r = await fetch(BASE + '/api/scan-sake', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) },
-    body: JSON.stringify({ image: dataUrl }),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let r;
+  try {
+    r = await fetch(BASE + '/api/scan-sake', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) },
+      body: JSON.stringify({ image: dataUrl }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw new Error(ctrl.signal.aborted
+      ? 'That took too long — check your signal and try again.'
+      : 'Lost the connection mid-scan — check your signal and try again.');
+  } finally { clearTimeout(timer); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     const msg = data.error === 'no_api_key' ? 'Scanning isn’t switched on yet — just add the details below.'
