@@ -155,7 +155,7 @@ export async function home() {
   app().innerHTML = `
     <div class="screen pad-bottom-bar-2">
       <div class="topbar">
-        <a class="brand" href="#/"><span class="brand-logo" role="img" aria-label="Sake Journey"></span></a>
+        <a class="brand" href="#/welcome" aria-label="About Sake Journey"><span class="brand-logo" role="img" aria-label="Sake Journey"></span></a>
         <button class="iconbtn" id="toHost" aria-label="Host tools">${svg('users')}</button>
       </div>
 

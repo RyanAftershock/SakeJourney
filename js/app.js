@@ -7,6 +7,7 @@ import * as Net from './net.js';
 import { closeSheet } from './ui.js';
 import * as Guest from './views/guest.js';
 import * as Host from './views/host.js';
+import * as Welcome from './views/welcome.js';
 
 const app = () => document.getElementById('app');
 
@@ -25,9 +26,27 @@ export function go(hash) {
   else location.hash = hash;
 }
 
+// The root adapts to how the person arrived: a current event joined via the table QR (or a host
+// preview) lands on the event home; everyone else — newcomers, returning guests between events,
+// people whose last night was days ago — gets the welcome front door.
+async function rootRoute() {
+  let ev = session.activeEventId ? await Events.get(session.activeEventId) : null;
+  if (!ev && session.activeEventId) {
+    // A scanned QR set an event this device hasn't synced yet — pull before deciding, so a fresh
+    // phone landing from a real table code goes straight into the night, not the front door.
+    try { await Events.syncFromServer(); ev = await Events.get(session.activeEventId); } catch { /* offline */ }
+  }
+  // Landable = current by date OR explicitly joined tonight (QR/scan/peek — see isLandable).
+  // A signed-in host previewing an old event also bypasses the gate — "Preview" from the studio
+  // must always land on the event, even months later.
+  const ok = Welcome.isLandable(ev) || (ev && !ev.personal && !!Net.hostKey());
+  return ok ? Guest.home() : Welcome.welcome();
+}
+
 const ROUTES = [
-  [/^#?\/?$/,                    () => Guest.home()],
-  [/^#\/e\/([^/]+)$/,            (m) => { session.activeEventId = m[1]; go('#/'); }],
+  [/^#?\/?$/,                    () => rootRoute()],
+  [/^#\/welcome$/,               () => Welcome.welcome()],
+  [/^#\/e\/([^/]+)$/,            (m) => { session.activeEventId = m[1]; session.joinedEventAt = Date.now(); go('#/'); }],
   [/^#\/course\/(\d+)$/,        (m) => Guest.course(+m[1])],
   [/^#\/finale$/,               () => Guest.finale()],
   [/^#\/finale\/(\d+)$/,        (m) => Guest.finaleStep(+m[1])],
