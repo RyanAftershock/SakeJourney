@@ -121,6 +121,16 @@ async function boot() {
   await route();
 
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    // When a deploy lands, the new service worker takes control (skipWaiting + claim) while this
+    // page is still running the previous cached shell. Refresh once so people see the new version
+    // on their first revisit, not their second. Guarded: updates only (never the first install),
+    // at most once per page, and never while a dialog is open mid-task.
+    let hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController && !reloaded && !document.querySelector('.sheet')) { reloaded = true; location.reload(); }
+      hadController = true;
+    });
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 }
