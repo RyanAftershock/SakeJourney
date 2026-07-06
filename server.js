@@ -94,8 +94,8 @@ const SAKE_SCAN_SCHEMA = {
 const SAKE_SCAN_PROMPT = `You are identifying a specific bottle of sake from a photo of its label, for a personal tasting journal.
 Work in steps:
 1. Read EVERYTHING legible on the label — the romanized and Japanese name, the brewery (kura), the region/prefecture, the classification (e.g. Junmai Daiginjo), and any printed numbers (seimaibuai/polishing ratio, nihonshu-do/SMV, acidity, alcohol %).
-2. Use web_search to find reputable public information about THIS sake and its brewery — official brewery pages, importers/retailers, sake databases, and reviews. Search a few times if the first results are thin.
-3. Then finish by calling record_sake with your best synthesis.
+2. Use web_search to find reputable public information about THIS sake and its brewery — official brewery pages, importers/retailers, sake databases, and reviews. Be quick: ONE well-chosen search (sake name + brewery) is usually enough; search again only if the first result is thin.
+3. Then finish by calling record_sake with your best synthesis. Speed matters — a guest is waiting at a table.
 
 Rules:
 - Only state specs you can actually read on the label or find from a reputable source. NEVER invent numbers, awards, or notes.
@@ -328,7 +328,7 @@ async function identifySakeImage(mediaType, b64, useSearch) {
   const tools = [];
   // Basic (direct) web search — simplest server-tool shape, no code-execution routing; plenty for a
   // single-bottle lookup. max_uses caps cost/latency. record_sake is the client tool we read back.
-  if (useSearch) tools.push({ type: 'web_search_20250305', name: 'web_search', max_uses: 5 });
+  if (useSearch) tools.push({ type: 'web_search_20250305', name: 'web_search', max_uses: 3 });
   tools.push({ name: 'record_sake', description: 'Record the identified sake and its researched details.', input_schema: SAKE_SCAN_SCHEMA, strict: true });
   const messages = [{
     role: 'user',
@@ -585,16 +585,22 @@ async function handleAPI(req, res, url) {
     const email = guestEmailFromReq(req);
     if (!email) return sendJSON(res, 401, { error: 'unauthorized' });
     if (!ANTHROPIC_API_KEY) return sendJSON(res, 400, { error: 'no_api_key', message: 'Sake scanning is not enabled on this server.' });
-    if (!rateLimit('scan:' + email, 40, 60 * 60 * 1000) || !rateLimit('scanip:' + clientIp(req), 80, 60 * 60 * 1000))
+    // The client fires a quick + a full pass per scan, so the ceiling covers pairs comfortably.
+    if (!rateLimit('scan:' + email, 60, 60 * 60 * 1000) || !rateLimit('scanip:' + clientIp(req), 120, 60 * 60 * 1000))
       return sendJSON(res, 429, { error: 'too_many_requests', message: 'That’s a lot of scans — give it a minute.' });
     const b = await readBody(req);
     const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(b.image || '');
     if (!m) return sendJSON(res, 400, { error: 'bad_image' });
     try {
       let out;
-      // Prefer live web research; if that path errors (e.g. web search unavailable), still identify from the photo.
-      try { out = await identifySakeImage(m[1], m[2], true); }
-      catch (e) { console.error('scan-sake (with search) failed, retrying without:', e.message); out = await identifySakeImage(m[1], m[2], false); }
+      if (b.mode === 'quick') {
+        // Fast first read: vision + the model's own knowledge, no web research (forced tool, one shot).
+        out = await identifySakeImage(m[1], m[2], false);
+      } else {
+        // Prefer live web research; if that path errors (e.g. web search unavailable), still identify from the photo.
+        try { out = await identifySakeImage(m[1], m[2], true); }
+        catch (e) { console.error('scan-sake (with search) failed, retrying without:', e.message); out = await identifySakeImage(m[1], m[2], false); }
+      }
       return sendJSON(res, 200, sanitizeScan(out));
     } catch (e) { console.error('scan-sake failed:', e.message); return sendJSON(res, 502, { error: 'scan_failed', message: String(e.message || e) }); }
   }

@@ -2,7 +2,7 @@
    Venue wifi is unreliable; once loaded, the app runs from cache.
    Guest data lives in IndexedDB (see js/store.js), never here. */
 
-const CACHE = 'sake-journey-v23';
+const CACHE = 'sake-journey-v24';
 const SHELL = [
   './',
   './index.html',

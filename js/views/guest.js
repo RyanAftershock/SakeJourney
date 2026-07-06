@@ -806,7 +806,10 @@ export async function history() {
         ${it.course && it.course.pairing && it.course.pairing.text
           ? `<div class="faint" style="font-size:.82rem;margin-top:8px">${esc(it.event.host)}: “${esc(it.course.pairing.text)}”</div>` : ''}
         ${r.note ? `<div class="why" style="padding:12px;margin-top:10px"><div class="eyebrow" style="color:var(--ink-3);margin-bottom:4px">Your note</div><p style="font-size:1rem">${esc(r.note)}</p></div>` : ''}
-        <button class="linkbtn note-btn" data-idx="${idx}" style="padding:8px 0 0">${r.note ? 'Edit your note' : '＋ Add your tasting note'}</button>
+        <div class="row wrap" style="gap:0 18px">
+          <button class="linkbtn note-btn" data-idx="${idx}" style="padding:8px 0 0">${r.note ? 'Edit your note' : '＋ Add your tasting note'}</button>
+          ${it.sake.adhoc ? `<button class="linkbtn edit-pour" data-idx="${idx}" style="padding:8px 0 0">Edit pour</button>` : ''}
+        </div>
       </div>`;
     idx++;
   }
@@ -840,6 +843,10 @@ export async function history() {
   if ($('#toLogin')) $('#toLogin').onclick = () => go('#/login');
   if ($('#logout')) $('#logout').onclick = () => { Net.setGuestSession(null); toast('Signed out'); history(); };
   $$('.note-btn').forEach((b) => (b.onclick = () => editNote(items[+b.dataset.idx].rating)));
+  $$('.edit-pour').forEach((b) => (b.onclick = () => {
+    const it = items[+b.dataset.idx];
+    openAddSake(it.event, guest, { solo: !!it.event.personal, edit: { sake: it.sake, rating: it.rating } });
+  }));
   maybeRestoreDraft(ev, guest, 'history');
 }
 
@@ -1001,15 +1008,32 @@ function maybeRestoreDraft(ev, guest, screen) {
   }
 }
 
-async function openAddSake(ev, guest, { solo = false } = {}) {
-  let draft = readDraft();
+/** Rebuild a scan-shaped object from a stored sake, so editing shows its research card + expert dot. */
+function sakeToScan(s) {
+  if (!s || (!s.about && s.expertX == null && !s.brewery && !s.region)) return null;
+  return {
+    identified: true, confidence: 'high',
+    name: s.name || '', japaneseName: s.romaji || '', brewery: s.brewery || '', region: s.region || '',
+    grade: s.grade || '', type4: s.type4 || '',
+    expertX: s.expertX, expertY: s.expertY,   // may be undefined — renderMatrix only dots finite values
+    smv: s.smv || '', acidity: s.acidity || '', abv: s.abv || '', seimai: s.seimai || '',
+    profile: s.profile || '', tags: s.tags || [], about: s.about || '', sources: [],
+  };
+}
+
+async function openAddSake(ev, guest, { solo = false, edit = null } = {}) {
+  let draft = edit ? null : readDraft();   // editing an existing pour never mixes with a new-pour draft
   if (draft && (draft.solo !== solo || (!solo && draft.evId !== ev.id))) draft = null;
-  const heading = solo ? 'Log a sake' : 'A surprise pour';
-  const intro = solo
+  const heading = edit ? 'Edit this pour' : (solo ? 'Log a sake' : 'A surprise pour');
+  const intro = edit
+    ? 'Fix the name, re-scan the label, retake the photo, or remove it from your journey.'
+    : solo
     ? 'Tasting a sake anywhere — a bar, a bottle at home? Snap the label and we’ll try to identify it and research it for you.'
     : `${esc(ev.host || 'Your host')} poured something off-menu? Capture it and add it to your night.`;
   const namePh = solo ? 'e.g. Dassai 45, or ‘the one at the izakaya’' : 'e.g. Dassai 45, or ‘the cloudy one’';
   const canScan = solo && !!Net.guestToken();   // scanning is a signed-in, server-side feature
+  const initName = edit ? (edit.sake.name || '') : (draft && draft.name) || '';
+  const initScore = edit ? (edit.rating.s1 || 0) : (draft && draft.score) || 0;
   const body = openSheet(`
     <h2 class="serif" style="font-size:1.6rem">${heading}</h2>
     <p class="muted" style="font-size:.92rem;margin:4px 0 16px">${intro}</p>
@@ -1017,22 +1041,26 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     ${canScan ? `<button class="btn subtle block mt-8 hidden" id="spScan">${svg('sparkle')} Identify this sake with AI</button>` : ''}
     <div id="spFound"></div>
     <label class="field mt-16"><span class="lab">What is it?</span>
-      <input class="inp" id="spName" placeholder="${namePh}" value="${esc((draft && draft.name) || '')}"></label>
+      <input class="inp" id="spName" placeholder="${namePh}" value="${esc(initName)}"></label>
     <div class="rate-block center card" style="background:var(--surface)">
       <div class="rate-label">First impression</div>
-      <div class="hearts-wrap">${heartsHTML((draft && draft.score) || 0)}</div>
+      <div class="hearts-wrap">${heartsHTML(initScore)}</div>
       <div class="rate-word"></div>
     </div>
     ${solo ? `<div id="spMatrix"></div>` : ''}
-    <button class="btn primary block mt-16" id="spSave">${solo ? 'Save to my journey' : 'Add to my night'}</button>
+    <button class="btn primary block mt-16" id="spSave">${edit ? 'Save changes' : solo ? 'Save to my journey' : 'Add to my night'}</button>
+    ${edit ? `<button class="linkbtn" id="spDelete" style="display:block;margin:10px auto 0;color:var(--danger)">Remove this pour from my journey</button>` : ''}
     <button class="linkbtn" id="spCancel" style="display:block;margin:8px auto 0">Cancel</button>
-  `, { label: heading, onClose: clearDraft });   // any deliberate close (cancel, Escape, navigation) drops the draft
+  `, { label: heading, onClose: edit ? null : clearDraft });   // deliberate close drops a NEW-pour draft
 
-  let photo = (draft && draft.photo) || null, score = (draft && draft.score) || 0,
-      scanned = (draft && draft.scanned) || null,
-      myX = draft && draft.myX != null ? draft.myX : null, myY = draft && draft.myY != null ? draft.myY : null;
+  let photo = edit ? photoOf(edit.rating) : (draft && draft.photo) || null,
+      score = initScore,
+      scanned = edit ? sakeToScan(edit.sake) : (draft && draft.scanned) || null,
+      myX = edit ? (edit.rating.myX != null ? edit.rating.myX : null) : (draft && draft.myX != null ? draft.myX : null),
+      myY = edit ? (edit.rating.myY != null ? edit.rating.myY : null) : (draft && draft.myY != null ? draft.myY : null);
   const q = (sel) => body.querySelector(sel);
   const saveDraft = () => {
+    if (edit) return;                // edits change the real record on save — no draft involved
     if (!body.isConnected) return;   // sheet was closed while an await was pending — a deliberate
                                      // close cleared the draft; never resurrect it from a continuation
     try {
@@ -1117,23 +1145,44 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
     const stageTimer = setInterval(() => { if (si < stages.length - 1) { si++; showStage(); } }, 9000);
     let wake = null;
     try { wake = navigator.wakeLock ? await navigator.wakeLock.request('screen') : null; } catch { /* not granted — proceed */ }
-    try {
-      scanned = await Net.scanSake(photo);
-      if (!body.isConnected) return;   // sheet closed during the scan — don't toast or resurrect a draft
+    // Two passes in parallel: a quick vision-only read lands in seconds, the researched one swaps
+    // in when it's ready — the guest starts checking the name while the web work continues.
+    const applyScan = (result, note) => {
+      if (!body.isConnected) return;
+      scanned = result;
       const nameEl = q('#spName');
-      if (scanned.name && !nameEl.value.trim()) nameEl.value = scanned.name;
-      q('#spFound').innerHTML = scanAboutHTML(scanned);
+      if (result.name && !nameEl.value.trim()) nameEl.value = result.name;
+      q('#spFound').innerHTML = scanAboutHTML(result) + (note || '');
       renderMatrix();
       saveDraft();
-      toast(scanned.identified ? 'Identified ✨' : 'Logged what we could read');
-    } catch (e) {
-      if (!body.isConnected) return;
-      q('#spFound').innerHTML = `
-        <div class="card mt-8" style="border-color:color-mix(in srgb, var(--danger) 40%, var(--line))">
-          <div class="eyebrow" style="color:var(--danger)">Couldn’t identify it</div>
-          <p class="muted" style="font-size:.88rem;margin-top:4px">${esc(e.message || 'Something went wrong.')}</p>
-          <p class="faint" style="font-size:.8rem;margin-top:6px">Keep the app open while it works, or just fill in the name below — your pour still saves.</p>
-        </div>`;
+    };
+    let fullSettled = false;
+    const quickP = Net.scanSake(photo, { mode: 'quick', timeoutMs: 60000 })
+      .then((r) => ({ ok: true, r }), (e) => ({ ok: false, e }));
+    const fullP = Net.scanSake(photo)
+      .then((r) => ({ ok: true, r }), (e) => ({ ok: false, e }));
+    quickP.then((res) => {
+      if (res.ok && !fullSettled) applyScan(res.r,
+        `<p class="faint center" style="font-size:.78rem;margin-top:8px"><span class="spin"></span> checking the web for more…</p>`);
+    });
+    const full = await fullP;
+    fullSettled = true;
+    const quick = await quickP;
+    try {
+      if (full.ok) {
+        applyScan(full.r);
+        if (body.isConnected) toast(full.r.identified ? 'Identified ✨' : 'Logged what we could read');
+      } else if (quick.ok) {
+        // The label read stands; only the web research failed — say so quietly, don't alarm.
+        applyScan(quick.r, `<p class="faint center" style="font-size:.78rem;margin-top:8px">couldn’t reach the web for extra research — these details are from the label</p>`);
+      } else if (body.isConnected) {
+        q('#spFound').innerHTML = `
+          <div class="card mt-8" style="border-color:color-mix(in srgb, var(--danger) 40%, var(--line))">
+            <div class="eyebrow" style="color:var(--danger)">Couldn’t identify it</div>
+            <p class="muted" style="font-size:.88rem;margin-top:4px">${esc(full.e && full.e.message || 'Something went wrong.')}</p>
+            <p class="faint" style="font-size:.8rem;margin-top:6px">Keep the app open while it works, or just fill in the name below — your pour still saves.</p>
+          </div>`;
+      }
     } finally {
       clearInterval(stageTimer);
       if (wake) { try { wake.release(); } catch { /* already released on tab hide */ } }
@@ -1147,14 +1196,28 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
   showPhoto();
   if (scanned) q('#spFound').innerHTML = scanAboutHTML(scanned);
   q('#spCancel').onclick = () => closeSheet();
+  if (edit) q('#spDelete').onclick = async () => {
+    if (!confirm(`Remove “${edit.sake.name}” from your journey?`)) return;
+    // Soft-delete: the adhoc sake is flagged (guests may upsert their own adhoc bottles) and the
+    // rating is cleared of everything that makes a pour count, so it drops out of every journey —
+    // this device, other signed-in devices, and the server aggregate alike.
+    await Sakes.save({ ...edit.sake, _deleted: true });
+    await Ratings.save(edit.rating.guestId, edit.rating.eventId, edit.sake.id, {
+      s1: null, s2: null, wouldBuy: false, photoBottle: null, photoFood: null, photo: null,
+      note: '', myX: null, myY: null, logged: false,
+    });
+    closeSheet();
+    toast('Removed from your journey');
+    go('#/history');
+  };
   q('#spSave').onclick = async () => {
     const name = q('#spName').value.trim();
     if (!name && !photo) { toast('Add a name or a photo'); return; }
     // A solo pour attaches to this device's guest and the personal journal — make sure both exist.
-    if (solo) guest = await Guests.ensure(SOLO_EVENT.id);
+    if (!edit && solo) guest = await Guests.ensure(SOLO_EVENT.id);
     const sc = scanned || {};
     const s = {
-      id: uid('s'),
+      id: edit ? edit.sake.id : uid('s'),
       name: name || sc.name || (solo ? 'A sake' : 'Surprise pour'),
       romaji: sc.japaneseName || '',
       brewery: sc.brewery || (solo ? '' : 'Off-menu'),
@@ -1166,13 +1229,24 @@ async function openAddSake(ev, guest, { solo = false } = {}) {
       profile: sc.profile || (solo ? 'A sake you logged on your own.' : 'A spontaneous pour, added at the table.'),
       tags: (sc.tags && sc.tags.length) ? sc.tags : (solo ? ['solo'] : ['surprise']),
       about: sc.about || '',
-      adhoc: true, eventId: ev.id, addedBy: guest.id,
+      adhoc: true,
+      eventId: edit ? edit.sake.eventId : ev.id,
+      addedBy: edit ? edit.sake.addedBy : guest.id,
     };
     if (scanned && Number.isFinite(+sc.expertX) && (sc.type4 || sc.identified)) { s.expertX = clampPct(sc.expertX); s.expertY = clampPct(sc.expertY); }
     await Sakes.save(s);
+    // Ratings merge server- and client-side, so an edit only touches these fields — the guest's
+    // note, finale re-rank score and take-home flag on this pour all survive untouched.
     const patch = { s1: score || null, photoBottle: photo };
     if (solo) patch.logged = true;   // a named solo entry counts even without a score
-    if (myX !== null && myY !== null) { patch.myX = myX; patch.myY = myY; }
+    patch.myX = myX; patch.myY = myY;   // null clears a dot the guest removed; numbers persist it
+    if (edit) {
+      await Ratings.save(edit.rating.guestId, edit.rating.eventId, s.id, patch);
+      closeSheet();
+      toast('Updated ✓');
+      go('#/history');
+      return;
+    }
     await Ratings.save(guest.id, ev.id, s.id, patch);
     closeSheet();
     toast(`Added “${s.name}” ✨`);
