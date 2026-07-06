@@ -192,8 +192,10 @@ export function pickPhoto() {
 }
 async function downscale(file, max = 1400, quality = 0.82) {
   // createImageBitmap decodes more formats (and off the main thread); fall back to <img>.
+  // imageOrientation from-image is explicit so portrait camera shots keep their EXIF rotation —
+  // browsers that reject the option (old Firefox) throw and take the <img> path, which honours EXIF.
   let src = null, w = 0, h = 0;
-  try { src = await createImageBitmap(file); w = src.width; h = src.height; } catch { /* try <img> */ }
+  try { src = await createImageBitmap(file, { imageOrientation: 'from-image' }); w = src.width; h = src.height; } catch { /* try <img> */ }
   if (!src) {
     src = await new Promise((resolve, reject) => {
       const img = new Image();
